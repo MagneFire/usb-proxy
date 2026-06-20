@@ -15,6 +15,7 @@
 #include <linux/types.h>
 
 #include "host-raw-gadget.h"
+#include <poll.h>
 
 struct raw_gadget_device host_device_desc;
 
@@ -50,23 +51,55 @@ void usb_raw_run(int fd) {
 	}
 }
 
-void usb_raw_event_fetch(int fd, struct usb_raw_event *event) {
+int usb_raw_event_fetch(int fd, struct usb_raw_event *event) {
+	struct pollfd pfd = { .fd = fd, .events = POLLRDNORM, .revents = 0 };
+	int rv_poll = poll(&pfd, 1, 100);
+	if (rv_poll < 0) {
+		if (errno == EINTR) return -1;
+		perror("poll()");
+		exit(EXIT_FAILURE);
+	} else if (rv_poll == 0) {
+		errno = EAGAIN;
+		return -1;
+	} else {
+		if (pfd.revents & (POLLHUP | POLLERR)) {
+			errno = ESHUTDOWN;
+			return -1;
+		}
+	}
+
 	int rv = ioctl(fd, USB_RAW_IOCTL_EVENT_FETCH, event);
 	if (rv < 0) {
-		if (errno == EINTR) {
-			event->length = 4294967295;
-			return;
-		}
-		perror("ioctl(USB_RAW_IOCTL_EVENT_FETCH)");
+		if (errno == EAGAIN) return rv;
+		if (errno == ESHUTDOWN) return rv;
+		perror("ioctl(EVENT_FETCH)");
 		exit(EXIT_FAILURE);
 	}
+	return rv;
 }
 
 int usb_raw_ep0_read(int fd, struct usb_raw_ep_io *io) {
+	struct pollfd pfd = { .fd = fd, .events = POLLRDNORM, .revents = 0 };
+	int rv_poll = poll(&pfd, 1, 100);
+	if (rv_poll < 0) {
+		if (errno == EINTR) return -1;
+		perror("poll()");
+		exit(EXIT_FAILURE);
+	} else if (rv_poll == 0) {
+		errno = EAGAIN;
+		return -1;
+	} else {
+		if (pfd.revents & (POLLHUP | POLLERR)) {
+			errno = ESHUTDOWN;
+			return -1;
+		}
+	}
+
 	int rv = ioctl(fd, USB_RAW_IOCTL_EP0_READ, io);
 	if (rv < 0) {
-		if (errno == EBUSY)
-			return rv;
+		if (errno == EBUSY) return rv;
+		if (errno == EAGAIN) return rv;
+		if (errno == ESHUTDOWN) return rv;
 		perror("ioctl(USB_RAW_IOCTL_EP0_READ)");
 		exit(EXIT_FAILURE);
 	}
@@ -74,8 +107,26 @@ int usb_raw_ep0_read(int fd, struct usb_raw_ep_io *io) {
 }
 
 int usb_raw_ep0_write(int fd, struct usb_raw_ep_io *io) {
+	struct pollfd pfd = { .fd = fd, .events = POLLWRNORM, .revents = 0 };
+	int rv_poll = poll(&pfd, 1, 100);
+	if (rv_poll < 0) {
+		if (errno == EINTR) return -1;
+		perror("poll()");
+		exit(EXIT_FAILURE);
+	} else if (rv_poll == 0) {
+		errno = EAGAIN;
+		return -1;
+	} else {
+		if (pfd.revents & (POLLHUP | POLLERR)) {
+			errno = ESHUTDOWN;
+			return -1;
+		}
+	}
+
 	int rv = ioctl(fd, USB_RAW_IOCTL_EP0_WRITE, io);
 	if (rv < 0) {
+		if (errno == EAGAIN) return rv;
+		if (errno == ESHUTDOWN) return rv;
 		perror("ioctl(USB_RAW_IOCTL_EP0_WRITE)");
 		exit(EXIT_FAILURE);
 	}
@@ -101,18 +152,28 @@ int usb_raw_ep_disable(int fd, uint32_t num) {
 }
 
 int usb_raw_ep_read(int fd, struct usb_raw_ep_io *io) {
+	struct pollfd pfd = { .fd = fd, .events = POLLRDNORM, .revents = 0 };
+	int rv_poll = poll(&pfd, 1, 100);
+	if (rv_poll < 0) {
+		if (errno == EINTR) return -1;
+		perror("poll()");
+		exit(EXIT_FAILURE);
+	} else if (rv_poll == 0) {
+		errno = EAGAIN;
+		return -1;
+	} else {
+		if (pfd.revents & (POLLHUP | POLLERR)) {
+			errno = ESHUTDOWN;
+			return -1;
+		}
+	}
+
 	int rv = ioctl(fd, USB_RAW_IOCTL_EP_READ, io);
 	if (rv < 0) {
-		if (errno == EINPROGRESS) {
-			// Ignore failures caused by the test that halts endpoints.
-			return rv;
-		}
-		else if (errno == ESHUTDOWN) {
-			// Ignore failures caused by device reset.
-			return rv;
-		}
-		else if (errno == EBUSY)
-			return rv;
+		if (errno == EINPROGRESS) return rv;
+		else if (errno == ESHUTDOWN) return rv;
+		else if (errno == EBUSY) return rv;
+		else if (errno == EAGAIN) return rv;
 		perror("ioctl(USB_RAW_IOCTL_EP_READ)");
 		exit(EXIT_FAILURE);
 	}
@@ -120,18 +181,28 @@ int usb_raw_ep_read(int fd, struct usb_raw_ep_io *io) {
 }
 
 int usb_raw_ep_write(int fd, struct usb_raw_ep_io *io) {
+	struct pollfd pfd = { .fd = fd, .events = POLLWRNORM, .revents = 0 };
+	int rv_poll = poll(&pfd, 1, 100);
+	if (rv_poll < 0) {
+		if (errno == EINTR) return -1;
+		perror("poll()");
+		exit(EXIT_FAILURE);
+	} else if (rv_poll == 0) {
+		errno = EAGAIN;
+		return -1;
+	} else {
+		if (pfd.revents & (POLLHUP | POLLERR)) {
+			errno = ESHUTDOWN;
+			return -1;
+		}
+	}
+
 	int rv = ioctl(fd, USB_RAW_IOCTL_EP_WRITE, io);
 	if (rv < 0) {
-		if (errno == EINPROGRESS) {
-			// Ignore failures caused by the test that halts endpoints.
-			return rv;
-		}
-		else if (errno == ESHUTDOWN) {
-			// Ignore failures caused by device reset.
-			return rv;
-		}
-		else if (errno == EBUSY)
-			return rv;
+		if (errno == EINPROGRESS) return rv;
+		else if (errno == ESHUTDOWN) return rv;
+		else if (errno == EBUSY) return rv;
+		else if (errno == EAGAIN) return rv;
 		perror("ioctl(USB_RAW_IOCTL_EP_WRITE)");
 		exit(EXIT_FAILURE);
 	}

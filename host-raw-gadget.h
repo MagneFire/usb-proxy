@@ -155,7 +155,7 @@ int usb_raw_open();
 void usb_raw_init(int fd, enum usb_device_speed speed,
 			const char *driver, const char *device);
 void usb_raw_run(int fd);
-void usb_raw_event_fetch(int fd, struct usb_raw_event *event);
+int usb_raw_event_fetch(int fd, struct usb_raw_event *event);
 int usb_raw_ep0_read(int fd, struct usb_raw_ep_io *io);
 int usb_raw_ep0_write(int fd, struct usb_raw_ep_io *io);
 int usb_raw_ep_enable(int fd, struct usb_endpoint_descriptor *desc);
