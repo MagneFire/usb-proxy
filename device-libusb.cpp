@@ -1,4 +1,5 @@
 #include "device-libusb.h"
+#include <sys/time.h>
 
 libusb_device 			**devs;
 libusb_device_handle 		*dev_handle;
@@ -21,9 +22,11 @@ int hotplug_callback(struct libusb_context *ctx __attribute__((unused)),
 
 void *hotplug_monitor(void *arg __attribute__((unused))) {
 	printf("Start hotplug_monitor thread, thread id(%d)\n", gettid());
-	while(true) {
-		usleep(100 * 1000);
-		libusb_handle_events_completed(NULL, NULL);
+	struct timeval tv;
+	tv.tv_sec = 0;
+	tv.tv_usec = 100000; // 100ms timeout
+	while(!please_stop_ep0) {
+		libusb_handle_events_timeout_completed(context, &tv, NULL);
 	}
 }
 
