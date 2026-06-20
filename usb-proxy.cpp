@@ -315,9 +315,6 @@ int main(int argc, char **argv)
 	delete[] host_device_desc.configs;
 	delete[] device_config_desc;
 
-	if (context && callback_handle != -1) {
-		libusb_hotplug_deregister_callback(context, callback_handle);
-	}
 	if (hotplug_monitor_thread &&
 		pthread_join(hotplug_monitor_thread, NULL)) {
 		fprintf(stderr, "Error join hotplug_monitor_thread\n");

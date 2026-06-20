@@ -28,6 +28,12 @@ void *hotplug_monitor(void *arg __attribute__((unused))) {
 	while(!please_stop_ep0) {
 		libusb_handle_events_timeout_completed(context, &tv, NULL);
 	}
+
+	// Safely deregister the callback from the event handling thread
+	if (callback_handle != -1) {
+		libusb_hotplug_deregister_callback(context, callback_handle);
+		callback_handle = -1;
+	}
 }
 
 int get_descriptor(libusb_device *device) {
