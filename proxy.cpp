@@ -129,6 +129,9 @@ void *ep_loop_write(void *arg) {
 
 		if (ep.bEndpointAddress & USB_DIR_IN) {
 			int rv = usb_raw_ep_write(fd, (struct usb_raw_ep_io *)&io);
+			if (rv < 0 && errno == EAGAIN) {
+				continue;
+			}
 			if (rv < 0 && errno == ESHUTDOWN) {
 				printf("EP%x(%s_%s): device likely reset, stopping thread\n",
 					ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
@@ -223,6 +226,9 @@ void *ep_loop_read(void *arg) {
 			io.inner.length = sizeof(io.data);
 
 			int rv = usb_raw_ep_read(fd, (struct usb_raw_ep_io *)&io);
+			if (rv < 0 && errno == EAGAIN) {
+				continue;
+			}
 			if (rv < 0 && errno == ESHUTDOWN) {
 				printf("EP%x(%s_%s): device likely reset, stopping thread\n",
 					ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
@@ -351,7 +357,14 @@ void ep0_loop(int fd) {
 		event.inner.type = 0;
 		event.inner.length = sizeof(event.ctrl);
 
-		usb_raw_event_fetch(fd, (struct usb_raw_event *)&event);
+		int rv_fetch = usb_raw_event_fetch(fd, (struct usb_raw_event *)&event);
+		if (rv_fetch < 0 && errno == EAGAIN) {
+			continue;
+		}
+		if (rv_fetch < 0 && errno == ESHUTDOWN) {
+			printf("End for EP0, thread id(%d)\n", gettid());
+			return;
+		}
 		log_event((struct usb_raw_event *)&event);
 
 		if (event.inner.length == 4294967295) {
@@ -444,7 +457,10 @@ void ep0_loop(int fd) {
 				if (verbose_level >= 2)
 					printData(io, 0x00, "control", "in");
 
-				rv = usb_raw_ep0_write(fd, (struct usb_raw_ep_io *)&io);
+				while ((rv = usb_raw_ep0_write(fd, (struct usb_raw_ep_io *)&io)) < 0 && errno == EAGAIN) {
+				if (please_stop_ep0) break;
+					usleep(1000);
+				}
 				printf("ep0: transferred %d bytes (in)\n", rv);
 			}
 			else {
@@ -496,7 +512,10 @@ void ep0_loop(int fd) {
 				set_configuration_done_once = true;
 
 				// Ack request after spawning endpoint threads.
-				rv = usb_raw_ep0_read(fd, (struct usb_raw_ep_io *)&io);
+				while ((rv = usb_raw_ep0_read(fd, (struct usb_raw_ep_io *)&io)) < 0 && errno == EAGAIN) {
+				if (please_stop_ep0) break;
+					usleep(1000);
+				}
 			}
 			else if ((event.ctrl.bRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD &&
 					event.ctrl.bRequest == USB_REQ_SET_INTERFACE) {
@@ -551,7 +570,10 @@ void ep0_loop(int fd) {
 				}
 
 				// Ack request after spawning endpoint threads.
-				rv = usb_raw_ep0_read(fd, (struct usb_raw_ep_io *)&io);
+				while ((rv = usb_raw_ep0_read(fd, (struct usb_raw_ep_io *)&io)) < 0 && errno == EAGAIN) {
+				if (please_stop_ep0) break;
+					usleep(1000);
+				}
 			}
 			else {
 				if (injection_enabled) {
@@ -573,7 +595,10 @@ void ep0_loop(int fd) {
 				}
 
 				// Retrieve data for sending request to proxied device.
-				rv = usb_raw_ep0_read(fd, (struct usb_raw_ep_io *)&io);
+				while ((rv = usb_raw_ep0_read(fd, (struct usb_raw_ep_io *)&io)) < 0 && errno == EAGAIN) {
+				if (please_stop_ep0) break;
+					usleep(1000);
+				}
 
 				memcpy(control_data, io.data, event.ctrl.wLength);
 
