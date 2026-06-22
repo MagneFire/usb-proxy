@@ -1,0 +1,43 @@
+musb: gadget: service pending RX packet on requeue instead of flushing
+
+musb_ep_restart() flushes the RX FIFO whenever an OUT request becomes the
+head of the queue. If a packet has already been received into the FIFO before
+the request was queued -- which happens with gadget drivers that re-queue OUT
+requests outside completion context (e.g. raw-gadget servicing reads from user
+space), leaving a brief window with no request pending -- that packet is
+silently discarded. The host already had it ACKed, so it never resends, and the
+transfer deadlocks. On single-buffered PIO controllers (Allwinner sunxi) this
+reliably breaks bulk-OUT streams (e.g. the ADB CNXN payload, leaving the device
+"offline"); double-buffered/large-FIFO controllers (dwc2/dwc3) happen to hide
+it.
+
+Service an already-pending packet (RXPKTRDY) via rxstate() instead of flushing.
+
+This is the proper in-tree counterpart to the out-of-tree musbfix.ko workaround
+in this directory.
+
+--- a/drivers/usb/musb/musb_gadget.c
++++ b/drivers/usb/musb/musb_gadget.c
+@@ void musb_ep_restart(struct musb *musb, struct musb_request *req)
+ 	if (req->tx) {
+ 		txstate(musb, req);
+ 	} else {
+ 		csr = musb_readw(epio, MUSB_RXCSR);
+-		csr |= MUSB_RXCSR_FLUSHFIFO | MUSB_RXCSR_P_WZC_BITS;
+-		musb_writew(epio, MUSB_RXCSR, csr);
+-		musb_writew(epio, MUSB_RXCSR, csr);
++		/*
++		 * If a packet already arrived into the FIFO before this request
++		 * was queued, don't flush it away -- the host already had it
++		 * ACKed, so flushing silently drops it and stalls the transfer.
++		 * Service it instead.
++		 */
++		if (csr & MUSB_RXCSR_RXPKTRDY) {
++			rxstate(musb, req);
++		} else {
++			csr |= MUSB_RXCSR_FLUSHFIFO | MUSB_RXCSR_P_WZC_BITS;
++			musb_writew(epio, MUSB_RXCSR, csr);
++			musb_writew(epio, MUSB_RXCSR, csr);
++		}
+ 	}
+ }
