@@ -1,0 +1,13 @@
+# build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+*.symvers
+*.order
+.tmp_versions/
+modules.order
+# fetched kernel headers (downloaded by `make headers`)
+hdr/
