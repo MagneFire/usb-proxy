@@ -26,6 +26,7 @@ extern bool customized_config_enabled;
 extern bool reset_device_before_proxy;
 extern bool bmaxpacketsize0_must_greater_than_64;
 extern int iso_batch_size;
+extern bool gadget_is_musb;
 
 std::string hexToAscii(std::string input);
 int hexToDecimal(int input);
