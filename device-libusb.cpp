@@ -272,11 +272,14 @@ int send_data(uint8_t endpoint, uint8_t attributes, uint8_t *dataptr,
 				if (verbose_level > 2)
 					printf("Sent %d bytes (Bulk) to EP%02x\n", transferred, endpoint);
 			}
-			if ((result == LIBUSB_ERROR_PIPE || result == LIBUSB_ERROR_TIMEOUT))
+			// Only a genuine stall (PIPE) is a halt to clear. Clearing on a
+			// timeout resets the data toggle, and retrying a timed-out OUT
+			// after that reset risks duplicating the transfer.
+			if (result == LIBUSB_ERROR_PIPE)
 				libusb_clear_halt(dev_handle, endpoint);
 
 			attempt++;
-		} while ((result == LIBUSB_ERROR_PIPE || result == LIBUSB_ERROR_TIMEOUT || transferred != length)
+		} while ((result == LIBUSB_ERROR_PIPE || transferred != length)
 					&& attempt < MAX_ATTEMPTS);
 		break;
 	case USB_ENDPOINT_XFER_INT:
@@ -451,11 +454,15 @@ int receive_data(uint8_t endpoint, uint8_t attributes, uint16_t maxPacketSize,
 			result = libusb_bulk_transfer(dev_handle, endpoint, *dataptr, maxPacketSize, length, timeout);
 			if (result == LIBUSB_SUCCESS && verbose_level > 2)
 				printf("Received bulk data(%d) bytes\n", *length);
-			if ((result == LIBUSB_ERROR_PIPE || result == LIBUSB_ERROR_TIMEOUT))
+			// A timeout on a bulk-IN poll is normal (the device simply had
+			// no data to send). Only a genuine stall (PIPE) is a halt that
+			// warrants clearing; clearing on a timeout resets the data toggle
+			// and corrupts an otherwise healthy stream.
+			if (result == LIBUSB_ERROR_PIPE)
 				libusb_clear_halt(dev_handle, endpoint);
 
 			attempt++;
-		} while ((result == LIBUSB_ERROR_PIPE || result == LIBUSB_ERROR_TIMEOUT) && attempt < MAX_ATTEMPTS);
+		} while (result == LIBUSB_ERROR_PIPE && attempt < MAX_ATTEMPTS);
 		break;
 	case USB_ENDPOINT_XFER_INT:
 		*dataptr = new uint8_t[maxPacketSize];
@@ -465,7 +472,10 @@ int receive_data(uint8_t endpoint, uint8_t attributes, uint16_t maxPacketSize,
 		break;
 	}
 
-	if (result != LIBUSB_SUCCESS) {
+	// A timeout on a bulk/interrupt IN poll just means the device had nothing
+	// to send this round; it is expected and not an error worth reporting.
+	if (result != LIBUSB_SUCCESS &&
+	    (result != LIBUSB_ERROR_TIMEOUT || verbose_level > 0)) {
 		fprintf(stderr, "Transfer error receiving on EP%02x: %s\n",
 				endpoint, libusb_strerror((libusb_error)result));
 	}

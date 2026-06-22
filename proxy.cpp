@@ -859,7 +859,12 @@ void *ep_loop_read(void *arg) {
 					break;
 				}
 
-				if (nbytes >= 0) {
+				// Only forward a read that actually succeeded. A timeout
+				// reports nbytes == 0 with no real data; forwarding it would
+				// inject a spurious zero-length packet to the host (which
+				// breaks the stream on musb). A genuine device ZLP arrives as
+				// LIBUSB_SUCCESS with nbytes == 0 and is still forwarded.
+				if (rv == LIBUSB_SUCCESS) {
 					memcpy(io.data, data, nbytes);
 					io.inner.ep = ep_num;
 					io.inner.flags = 0;
