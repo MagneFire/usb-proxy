@@ -892,7 +892,15 @@ void *ep_loop_read(void *arg) {
 			// Passing a larger buffer (e.g. 4096) causes musb-hdrc to report
 			// req->actual = req->length instead of the real frame size, which
 			// then triggers EMSGSIZE (-90) when forwarding to the physical device.
-			if ((ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_ISOC)
+			//
+			// musb-hdrc has the same buffer-size sensitivity on bulk/interrupt
+			// OUT endpoints: with a multi-packet buffer it accepts the first
+			// transfer but then stalls/NAKs subsequent OUT data (e.g. the host
+			// sends an ADB CNXN header but its follow-up payload never arrives),
+			// so clamp every OUT read to one packet on musb. Other UDCs (dwc2)
+			// have a large RX FIFO and keep the full buffer for throughput.
+			if ((ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_ISOC ||
+			    gadget_is_musb)
 				io.inner.length = usb_endpoint_maxp(&ep);
 			else
 				io.inner.length = sizeof(io.data);

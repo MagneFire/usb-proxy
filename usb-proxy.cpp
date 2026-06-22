@@ -1,4 +1,5 @@
 #include <atomic>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -21,6 +22,7 @@ bool reset_device_before_proxy = true;
 bool bmaxpacketsize0_must_greater_than_64 = true;
 bool auto_remap_endpoints = false;
 int iso_batch_size = ISO_BATCH_SIZE_DEFAULT;
+bool gadget_is_musb = false;
 enum usb_device_speed device_speed = USB_SPEED_HIGH;
 
 // Print the transform summary for a single injection rule.
@@ -526,6 +528,9 @@ int main(int argc, char **argv)
 			return 1;
 		}
 	}
+	// The musb-hdrc gadget controller mishandles OUT requests whose buffer is
+	// larger than one packet, so OUT reads are clamped to wMaxPacketSize for it.
+	gadget_is_musb = (strstr(driver, "musb") != NULL);
 	printf("Device is: %s\n", device);
 	printf("Driver is: %s\n", driver);
 	printf("vendor_id is: %d\n", vendor_id);
