@@ -2,6 +2,11 @@
 
 This software is a USB proxy based on [raw-gadget](https://github.com/xairy/raw-gadget) and libusb. It is recommended to run this repo on a computer that has an USB OTG port, such as `Raspberry Pi 4` or other [hardware](https://github.com/xairy/raw-gadget/tree/master/tests#results) that can work with `raw-gadget`, otherwise might need to use `dummy_hcd` kernel module to set up virtual USB Device and Host controller that connected to each other inside the kernel.
 
+> **Running on an Orange Pi Zero (sunxi musb)?** See
+> [`docs/orange-pi-headless-setup.md`](docs/orange-pi-headless-setup.md) for the
+> musb-specific fixes (including the `musbfix` kernel module) and a complete
+> headless deployment guide.
+
 ```
 ------------     -----------------------------------------------     -----------------------
 |          |     |                                             |     |                     |

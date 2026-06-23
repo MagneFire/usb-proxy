@@ -1,0 +1,11 @@
+# Drive usb-proxy by the presence of a proxied USB device.
+#
+# usb-proxy proxies whatever device is plugged in (it doesn't filter by
+# VID/PID), so this matches ANY non-hub USB device:
+#   plug/replug -> restart the service (fresh reconnect to the new device)
+#   unplug      -> stop the service (tear the gadget down)
+#
+# Note: usb-proxy.service is also enabled (WantedBy=multi-user.target), so it
+# starts at boot and polls for a device even if these rules don't fire.
+ACTION=="add",    SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}!="09", RUN+="/usr/bin/systemctl --no-block restart usb-proxy.service"
+ACTION=="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", RUN+="/usr/bin/systemctl --no-block stop usb-proxy.service"

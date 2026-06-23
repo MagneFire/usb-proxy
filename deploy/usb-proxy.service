@@ -1,0 +1,24 @@
+[Unit]
+Description=usb-proxy (raw-gadget USB proxy)
+Documentation=https://github.com/AristoChen/usb-proxy
+After=systemd-modules-load.service
+# Restarts can be frequent (device plug/unplug); never give up.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Adjust to wherever usb-proxy is checked out / built.
+WorkingDirectory=/home/darrel/usb-proxy
+# Safety net in case the modules-load.d entries didn't load for any reason.
+ExecStartPre=-/sbin/modprobe raw_gadget
+ExecStartPre=-/sbin/modprobe musbfix
+# stdbuf -oL: usb-proxy's stdout is block-buffered under systemd; force
+# line-buffering so the journal shows progress in real time.
+# No --vendor_id/--product_id: usb-proxy proxies the first USB device it finds,
+# so this works with any device.
+ExecStart=/usr/bin/stdbuf -oL -eL /home/darrel/usb-proxy/usb-proxy --device musb-hdrc.2.auto --driver musb-hdrc --enable_customized_config --auto_remap_endpoints
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
