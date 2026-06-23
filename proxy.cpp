@@ -1074,7 +1074,6 @@ void ep0_loop(int fd) {
 		// Normally, we would only need to check for USB_RAW_EVENT_RESET to handle a reset event.
 		// However, dwc2 is buggy and it reports a disconnect event instead of a reset.
 		if (event.inner.type == USB_RAW_EVENT_RESET || event.inner.type == USB_RAW_EVENT_DISCONNECT) {
-			printf("Resetting device\n");
 			// Normally, we would need to stop endpoint threads first and only then
 			// reset the device. However, libusb does not allow interrupting queued
 			// requests submitted via sync I/O. Thus, we reset the proxied device to
@@ -1082,7 +1081,17 @@ void ep0_loop(int fd) {
 			// to exit on please_stop_eps checks.
 			if (set_configuration_done_once)
 				please_stop_eps = true;
-			reset_device();
+			// Honour reset_device_before_proxy here too: when it is false the
+			// proxied device must never be reset (e.g. a device in fastboot mode
+			// drops off the bus on a USB reset). musb-hdrc emits spurious
+			// disconnect events during host enumeration that would otherwise
+			// reset it. When the reset is skipped, the endpoint threads still
+			// exit via their libusb transfer timeouts instead of being
+			// interrupted by the reset.
+			if (reset_device_before_proxy) {
+				printf("Resetting device\n");
+				reset_device();
+			}
 			if (set_configuration_done_once) {
 				struct raw_gadget_config *config = &host_device_desc.configs[host_device_desc.current_config];
 				printf("Stopping endpoint threads\n");
