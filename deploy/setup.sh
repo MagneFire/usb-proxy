@@ -50,7 +50,11 @@ if grep -qE '^[[:space:]]*g_serial' /etc/modules 2>/dev/null; then
 	sudo sed -i 's/^[[:space:]]*g_serial.*/#&  # disabled: conflicts with raw_gadget for the musb UDC/' /etc/modules
 fi
 
-echo "== 5/5 install + enable service and udev rule"
+echo "== 5/6 reduce SD writes (logs/swap already on zram via armbian-ramlog)"
+sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+sudo systemctl disable --now rsyslog.service 2>/dev/null || true   # redundant with journald
+
+echo "== 6/6 install + enable service and udev rule"
 # Point the unit at PROXY_DIR if it differs from the default.
 sed "s#/home/darrel/usb-proxy#$PROXY_DIR#g" "$REPO/deploy/usb-proxy.service" \
 	| sudo tee /etc/systemd/system/usb-proxy.service >/dev/null

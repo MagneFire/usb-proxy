@@ -210,6 +210,52 @@ End-to-end checks worth doing once:
 - **Kernel oops after a kernel update:** `musbfix` offsets no longer match —
   `sudo rmmod musbfix` (or reboot; the on-disk kernel is untouched) and rebuild.
 
+## SD-card wear & power-loss resilience
+
+The Orange Pi Zero is usually powered through the same OTG/USB connection, so
+**disconnecting the cable is an abrupt power cut**. Two goals: minimise SD
+writes (wear) and survive a yanked cable without corrupting the card.
+
+What's in place (Armbian defaults + the tweaks below) makes the box resilient
+*without* a read-only root:
+
+- **Logs live in RAM** — Armbian `armbian-ramlog` mounts `/var/log` on **zram**
+  and only rsyncs it to the SD **on a clean shutdown** (no periodic timer). So
+  the chatty per-packet usb-proxy output never touches the SD while running; on
+  a yank it's simply lost (no write, no corruption).
+- **Swap is on zram** (RAM), not the SD.
+- **Background writers disabled:**
+  ```sh
+  sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer
+  sudo systemctl disable --now rsyslog.service     # redundant with journald
+  ```
+- **Root mount** is `relatime,commit=120,errors=remount-ro` (writes batched
+  every 2 min, journal protects metadata, auto-remounts read-only on error).
+- Almost nothing else writes to `/` at runtime.
+
+Net effect: during normal operation the SD sees ~no writes; a yanked cable
+loses at most the last commit window of buffered data, and ext4 journaling
+prevents filesystem-structure corruption.
+
+### Read-only root (overlayroot) — does NOT work on this build
+
+A fully read-only root (writes diverted to a RAM overlay) would make power loss
+*completely* harmless. We tried it both manually and via Armbian's official
+`armbian-config` → Storage → **"Enable read only filesystem"** (`ROO001`, which
+drives the `overlayroot` package). **On this Armbian trunk build for sun8i-h3 it
+does not engage** — the overlayroot init hook never runs at boot (zero boot
+output; `/` stays `ext4 rw`). It's left **disabled** (`overlayroot=""`).
+
+If you need a guaranteed read-only root, the realistic options are:
+- Use an Armbian **stable** image (where `ROO001`/overlayroot is more likely to
+  work) rather than `current`/trunk.
+- Report it to Armbian (overlayroot not engaging on sun8i-h3 trunk).
+- A manual selective-`tmpfs` read-only setup (more involved; risks an unbootable
+  box, so only with SD-recovery access).
+
+Given how few SD writes remain, the measures above are usually sufficient for a
+frequently power-cycled appliance.
+
 ## File map
 
 | Path | Purpose |
