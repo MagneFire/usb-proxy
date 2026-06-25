@@ -736,8 +736,16 @@ void *ep_loop_write(void *arg) {
 						       data, length, USB_REQUEST_TIMEOUT);
 				if (rv == LIBUSB_ERROR_NO_DEVICE) {
 					delete[] data;
-					printf("EP%x(%s_%s): device likely reset, stopping thread\n",
+					printf("EP%x(%s_%s): device gone, exiting usb-proxy\n",
 						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
+					/* The proxied device is gone. libusb hotplug does not fire
+					 * without udev, and SIGINT-based shutdown can hang because
+					 * the EP0 loop is blocked on the still-connected host side.
+					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
+					 * the UDC) and the service manager respawns us to re-proxy
+					 * on replug. */
+					fflush(stdout);
+					_exit(0);
 					break;
 				}
 				if (rv != LIBUSB_SUCCESS)
@@ -747,8 +755,16 @@ void *ep_loop_write(void *arg) {
 						   data, length, USB_REQUEST_TIMEOUT);
 				if (rv == LIBUSB_ERROR_NO_DEVICE) {
 					delete[] data;
-					printf("EP%x(%s_%s): device likely reset, stopping thread\n",
+					printf("EP%x(%s_%s): device gone, exiting usb-proxy\n",
 						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
+					/* The proxied device is gone. libusb hotplug does not fire
+					 * without udev, and SIGINT-based shutdown can hang because
+					 * the EP0 loop is blocked on the still-connected host side.
+					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
+					 * the UDC) and the service manager respawns us to re-proxy
+					 * on replug. */
+					fflush(stdout);
+					_exit(0);
 					break;
 				}
 				delete[] data;
@@ -799,8 +815,16 @@ void *ep_loop_read(void *arg) {
 								usb_endpoint_maxp(&ep),
 								&batch, iso_batch_size, USB_REQUEST_TIMEOUT);
 				if (rv == LIBUSB_ERROR_NO_DEVICE) {
-					printf("EP%x(%s_%s): device likely reset, stopping thread\n",
+					printf("EP%x(%s_%s): device gone, exiting usb-proxy\n",
 						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
+					/* The proxied device is gone. libusb hotplug does not fire
+					 * without udev, and SIGINT-based shutdown can hang because
+					 * the EP0 loop is blocked on the still-connected host side.
+					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
+					 * the UDC) and the service manager respawns us to re-proxy
+					 * on replug. */
+					fflush(stdout);
+					_exit(0);
 					break;
 				}
 
@@ -852,8 +876,16 @@ void *ep_loop_read(void *arg) {
 							usb_endpoint_maxp(&ep),
 							&data, &nbytes, USB_REQUEST_TIMEOUT);
 				if (rv == LIBUSB_ERROR_NO_DEVICE) {
-					printf("EP%x(%s_%s): device likely reset, stopping thread\n",
+					printf("EP%x(%s_%s): device gone, exiting usb-proxy\n",
 						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
+					/* The proxied device is gone. libusb hotplug does not fire
+					 * without udev, and SIGINT-based shutdown can hang because
+					 * the EP0 loop is blocked on the still-connected host side.
+					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
+					 * the UDC) and the service manager respawns us to re-proxy
+					 * on replug. */
+					fflush(stdout);
+					_exit(0);
 					if (data)
 						delete[] data;
 					break;
