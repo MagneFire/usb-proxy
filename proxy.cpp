@@ -750,6 +750,28 @@ void *ep_loop_write(void *arg) {
 				}
 				if (rv != LIBUSB_SUCCESS)
 					delete[] data;
+			} else if ((ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK &&
+				   bulk_out_max_in_flight > 0) {
+				// Async bulk OUT: submit and keep several transfers in flight so
+				// the device-side bus stays busy between packets (see
+				// send_data_async). It takes ownership of `data` from here on —
+				// the completion callback frees it on success, or it is freed
+				// internally on error — so this branch never deletes it.
+				int rv = send_data_async(thread_info.device_bEndpointAddress,
+							 data, length, USB_REQUEST_TIMEOUT);
+				if (rv == LIBUSB_ERROR_NO_DEVICE) {
+					printf("EP%x(%s_%s): device gone, exiting usb-proxy\n",
+						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
+					/* The proxied device is gone. libusb hotplug does not fire
+					 * without udev, and SIGINT-based shutdown can hang because
+					 * the EP0 loop is blocked on the still-connected host side.
+					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
+					 * the UDC) and the service manager respawns us to re-proxy
+					 * on replug. */
+					fflush(stdout);
+					_exit(0);
+					break;
+				}
 			} else {
 				int rv = send_data(thread_info.device_bEndpointAddress, ep.bmAttributes,
 						   data, length, USB_REQUEST_TIMEOUT);
@@ -918,6 +940,21 @@ void *ep_loop_read(void *arg) {
 			}
 		}
 		else {
+			// Bound the OUT queue so a fast host (e.g. a fastboot download)
+			// can't outrun the device-side writer and grow the deque without
+			// limit. When full, stop reading; the gadget then NAKs the host
+			// (USB flow control) until the writer drains. Mirrors the IN-path
+			// cap above. With async bulk OUT the writer keeps the device bus
+			// busy, so in a healthy transfer this stays near-empty and never
+			// actually throttles the host.
+			data_mutex->lock();
+			bool queue_full = data_queue->size() >= 64;
+			data_mutex->unlock();
+			if (queue_full) {
+				usleep(50);
+				continue;
+			}
+
 			io.inner.ep = ep_num;
 			io.inner.flags = 0;
 			// For ISO OUT, limit the buffer to one packet (wMaxPacketSize).

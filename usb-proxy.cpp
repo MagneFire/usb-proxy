@@ -22,6 +22,7 @@ bool reset_device_before_proxy = true;
 bool bmaxpacketsize0_must_greater_than_64 = true;
 bool auto_remap_endpoints = false;
 int iso_batch_size = ISO_BATCH_SIZE_DEFAULT;
+int bulk_out_max_in_flight = BULK_OUT_IN_FLIGHT_DEFAULT;
 bool gadget_is_musb = false;
 enum usb_device_speed device_speed = USB_SPEED_HIGH;
 
@@ -116,8 +117,10 @@ void usage() {
 	printf("\t--injection_file: enable injection using the specified rules file\n");
 	printf("\t--enable_customized_config: enable the customized config feature\n");
 	printf("\t--auto_remap_endpoints: enable endpoint remapping when UDC can't use descriptors directly\n");
-	printf("\t--iso_batch_size N: number of isochronous packets per transfer (1-%d, default %d)\n\n",
+	printf("\t--iso_batch_size N: number of isochronous packets per transfer (1-%d, default %d)\n",
 		ISO_BATCH_SIZE_MAX, ISO_BATCH_SIZE_DEFAULT);
+	printf("\t--bulk_out_in_flight N: async bulk-OUT transfers kept in flight (0=synchronous, max %d, default %d)\n\n",
+		BULK_OUT_IN_FLIGHT_MAX, BULK_OUT_IN_FLIGHT_DEFAULT);
 	printf("* If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.\n");
 	printf("* If `driver` not specified, `usb-proxy` will use `dummy_udc` as default driver.\n");
 	printf("* If both `vendor_id` and `product_id` not specified, `usb-proxy` will connect\n");
@@ -470,6 +473,7 @@ int main(int argc, char **argv)
 		{"enable_customized_config", no_argument, &lopt, 9},
 		{"auto_remap_endpoints", no_argument, &lopt, 10},
 		{"iso_batch_size", required_argument, &lopt, 11},
+		{"bulk_out_in_flight", required_argument, &lopt, 12},
 		{0, 0, 0, 0}
 	};
 	while ((opt = getopt_long(argc, argv, optstring, long_options, &loidx)) != -1) {
@@ -521,6 +525,15 @@ int main(int argc, char **argv)
 			if (iso_batch_size > ISO_BATCH_SIZE_MAX)
 				iso_batch_size = ISO_BATCH_SIZE_MAX;
 			printf("Isochronous batch size set to %d\n", iso_batch_size);
+			break;
+		case 12:
+			bulk_out_max_in_flight = std::stoi(optarg);
+			if (bulk_out_max_in_flight < 0)
+				bulk_out_max_in_flight = 0;
+			if (bulk_out_max_in_flight > BULK_OUT_IN_FLIGHT_MAX)
+				bulk_out_max_in_flight = BULK_OUT_IN_FLIGHT_MAX;
+			printf("Bulk-OUT in-flight set to %d%s\n", bulk_out_max_in_flight,
+				bulk_out_max_in_flight == 0 ? " (synchronous)" : "");
 			break;
 
 		default:
@@ -585,6 +598,16 @@ int main(int argc, char **argv)
 		if (customized_config["bmaxpacketsize0_must_greater_than_64"] == false) {
 			printf("bmaxpacketsize0_must_greater_than_64 set to false\n");
 			bmaxpacketsize0_must_greater_than_64 = false;
+		}
+		if (customized_config.isMember("async_bulk_out_in_flight")) {
+			int v = customized_config["async_bulk_out_in_flight"].asInt();
+			if (v < 0)
+				v = 0;
+			if (v > BULK_OUT_IN_FLIGHT_MAX)
+				v = BULK_OUT_IN_FLIGHT_MAX;
+			bulk_out_max_in_flight = v;
+			printf("async_bulk_out_in_flight set to %d%s\n", v,
+				v == 0 ? " (synchronous)" : "");
 		}
 	}
 

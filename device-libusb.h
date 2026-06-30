@@ -9,6 +9,12 @@
 #define ISO_BATCH_SIZE_DEFAULT 8
 #define ISO_BATCH_SIZE_MAX 32
 
+// Async bulk-OUT: number of transfers kept in flight on a bulk OUT endpoint.
+// Default keeps the device-side bus busy without flooding the kernel; 0 selects
+// the legacy synchronous send_data() path. Configurable (CLI / config.json).
+#define BULK_OUT_IN_FLIGHT_DEFAULT 8
+#define BULK_OUT_IN_FLIGHT_MAX 64
+
 struct iso_packet_result {
 	uint8_t *data;
 	int actual_length;
@@ -43,6 +49,11 @@ int control_request(const usb_ctrlrequest *setup_packet, int *nbytes,
 			unsigned char **dataptr, int timeout);
 int send_data(uint8_t endpoint, uint8_t attributes, uint8_t *dataptr,
 			int length, int timeout);
+// Async bulk OUT. Takes ownership of dataptr: on success the completion
+// callback frees it; on any failure it is freed before returning. Returns
+// LIBUSB_SUCCESS once submitted (the transfer completes later on the event
+// thread), or a libusb error (notably LIBUSB_ERROR_NO_DEVICE).
+int send_data_async(uint8_t endpoint, uint8_t *dataptr, int length, int timeout);
 int send_iso_data(uint8_t endpoint, uint8_t *dataptr, int length, int timeout);
 int receive_data(uint8_t endpoint, uint8_t attributes, uint16_t maxPacketSize,
 			uint8_t **dataptr, int *length, int timeout);
