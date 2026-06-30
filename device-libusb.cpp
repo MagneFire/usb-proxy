@@ -298,6 +298,98 @@ int send_data(uint8_t endpoint, uint8_t attributes, uint8_t *dataptr,
 	return result;
 }
 
+// ---- Async bulk OUT --------------------------------------------------------
+// send_data() above forwards one bulk-OUT packet at a time: every
+// libusb_bulk_transfer() blocks for a full USB round trip before the next
+// packet is submitted, so the device-side bus goes idle between packets. For a
+// sustained download (e.g. a fastboot image) that idle gap throttles
+// throughput and lets the gadget-side queue back up until the transfer stalls.
+//
+// Instead keep up to bulk_out_max_in_flight URBs queued on the endpoint. The
+// kernel processes URBs on one endpoint FIFO, so submission order is delivery
+// order and the bulk stream stays in sequence. The single event thread
+// (hotplug_monitor) drives completions; the callback frees each buffer.
+static std::atomic<int> bulk_out_in_flight(0);
+static std::atomic<bool> bulk_out_device_gone(false);
+static std::atomic<int> bulk_out_error_count(0);
+
+static void bulk_out_callback(struct libusb_transfer *transfer) {
+	bulk_out_in_flight--;
+
+	if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+		if (transfer->status == LIBUSB_TRANSFER_NO_DEVICE)
+			bulk_out_device_gone = true;
+		else if (transfer->status == LIBUSB_TRANSFER_STALL)
+			libusb_clear_halt(dev_handle, transfer->endpoint);
+
+		int n = ++bulk_out_error_count;
+		if (n <= 10 || n % 100 == 0)
+			fprintf(stderr, "Bulk OUT EP%02x failed: status=%d, %d/%d bytes (total errors: %d)\n",
+				transfer->endpoint, transfer->status,
+				transfer->actual_length, transfer->length, n);
+	} else if (transfer->actual_length != transfer->length) {
+		// Short write: the device accepted fewer bytes than we sent. We can't
+		// resubmit the tail here without risking reordering against later
+		// in-flight URBs on this endpoint, so just report it (a corrupted
+		// download fails its own integrity check downstream).
+		int n = ++bulk_out_error_count;
+		if (n <= 10 || n % 100 == 0)
+			fprintf(stderr, "Short bulk OUT on EP%02x: %d/%d bytes (total short: %d)\n",
+				transfer->endpoint, transfer->actual_length, transfer->length, n);
+	} else if (verbose_level > 2) {
+		printf("Sent %d bytes (Bulk async) to EP%02x\n",
+			transfer->actual_length, transfer->endpoint);
+	}
+
+	// libusb_fill_bulk_transfer() set both ->buffer and ->user_data to the
+	// data buffer; free it exactly once.
+	delete[] (unsigned char *)transfer->user_data;
+	libusb_free_transfer(transfer);
+}
+
+int send_data_async(uint8_t endpoint, uint8_t *dataptr, int length, int timeout) {
+	if (bulk_out_device_gone) {
+		delete[] dataptr;
+		return LIBUSB_ERROR_NO_DEVICE;
+	}
+
+	// Backpressure. Bulk data must not be dropped (unlike ISO), so block until
+	// an in-flight slot frees rather than discarding the packet. Bail out if
+	// the device disappears (a completion callback set the flag) while waiting.
+	while (bulk_out_in_flight >= bulk_out_max_in_flight) {
+		if (bulk_out_device_gone) {
+			delete[] dataptr;
+			return LIBUSB_ERROR_NO_DEVICE;
+		}
+		usleep(50);
+	}
+
+	struct libusb_transfer *transfer = libusb_alloc_transfer(0);
+	if (!transfer) {
+		fprintf(stderr, "Failed to allocate libusb_transfer for bulk OUT.\n");
+		delete[] dataptr;
+		return LIBUSB_ERROR_OTHER;
+	}
+
+	// The callback frees both the transfer and the buffer (passed via user_data).
+	libusb_fill_bulk_transfer(transfer, dev_handle, endpoint, dataptr, length,
+				bulk_out_callback, dataptr, timeout);
+
+	int rv = libusb_submit_transfer(transfer);
+	if (rv != LIBUSB_SUCCESS) {
+		fprintf(stderr, "Bulk OUT submit failed on EP%02x: %s (len=%d)\n",
+			endpoint, libusb_strerror((libusb_error)rv), length);
+		if (rv == LIBUSB_ERROR_NO_DEVICE)
+			bulk_out_device_gone = true;
+		libusb_free_transfer(transfer);
+		delete[] dataptr;
+		return rv;
+	}
+
+	bulk_out_in_flight++;
+	return LIBUSB_SUCCESS;
+}
+
 void iso_transfer_callback(struct libusb_transfer *transfer) {
 	int *iso_completed = (int *)transfer->user_data;
 	*iso_completed = 1;
