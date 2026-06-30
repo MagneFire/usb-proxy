@@ -6,6 +6,13 @@ This software is a USB proxy based on [raw-gadget](https://github.com/xairy/raw-
 > [`docs/orange-pi-headless-setup.md`](docs/orange-pi-headless-setup.md) for the
 > musb-specific fixes (including the `musbfix` kernel module) and a complete
 > headless deployment guide.
+>
+> **Building the stateless Yocto appliance image?** The `meta-usbproxy` layer
+> turns an Orange Pi Zero into a single-purpose usb-proxy appliance (RAM
+> initramfs, musb fixes baked into the kernel). Its `DEVELOPMENT.md` is the full
+> developer guide: building both projects, the change workflows (including the
+> fast usb-proxy dev loop against the appliance), flashing, USB-serial access, and
+> the project quirks.
 
 ```
 ------------     -----------------------------------------------     -----------------------
