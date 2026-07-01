@@ -913,6 +913,10 @@ void *ep_loop_read(void *arg) {
 					break;
 				}
 
+				if (verbose_level > 0)
+					fprintf(stderr, "[in] EP%02x receive rv=%d nbytes=%d\n",
+						ep.bEndpointAddress, rv, nbytes);
+
 				// Only forward a read that actually succeeded. A timeout
 				// reports nbytes == 0 with no real data; forwarding it would
 				// inject a spurious zero-length packet to the host (which
