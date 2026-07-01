@@ -9,10 +9,12 @@
 #define ISO_BATCH_SIZE_DEFAULT 8
 #define ISO_BATCH_SIZE_MAX 32
 
-// Async bulk-OUT: number of transfers kept in flight on a bulk OUT endpoint.
-// Default keeps the device-side bus busy without flooding the kernel; 0 selects
-// the legacy synchronous send_data() path. Configurable (CLI / config.json).
-#define BULK_OUT_IN_FLIGHT_DEFAULT 8
+// Async bulk-OUT: number of transfers to keep in flight on a bulk OUT endpoint.
+// Default 0 = the synchronous send_data() path (the proven baseline). Async is
+// opt-in via --bulk_out_in_flight N / config.json "async_bulk_out_in_flight": it
+// did NOT help the musb gadget-RX stall (sync and async fail identically), but
+// may help controllers without that bug (dwc2). 8 is a reasonable value to try.
+#define BULK_OUT_IN_FLIGHT_DEFAULT 0
 #define BULK_OUT_IN_FLIGHT_MAX 64
 
 struct iso_packet_result {

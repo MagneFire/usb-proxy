@@ -313,14 +313,27 @@ static std::atomic<int> bulk_out_in_flight(0);
 static std::atomic<bool> bulk_out_device_gone(false);
 static std::atomic<int> bulk_out_error_count(0);
 
+// Diagnostic counters for the -v submit/complete/backpressure trace.
+static std::atomic<int> bulk_out_submit_count(0);
+static std::atomic<int> bulk_out_complete_count(0);
+
 static void bulk_out_callback(struct libusb_transfer *transfer) {
 	bulk_out_in_flight--;
+
+	int cc = ++bulk_out_complete_count;
+	if (verbose_level > 0)
+		fprintf(stderr, "[async] EP%02x complete #%d status=%d actual=%d/%d in_flight=%d\n",
+			transfer->endpoint, cc, transfer->status,
+			transfer->actual_length, transfer->length, bulk_out_in_flight.load());
 
 	if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
 		if (transfer->status == LIBUSB_TRANSFER_NO_DEVICE)
 			bulk_out_device_gone = true;
-		else if (transfer->status == LIBUSB_TRANSFER_STALL)
-			libusb_clear_halt(dev_handle, transfer->endpoint);
+		// NB: do not call libusb_clear_halt() (or any synchronous libusb call)
+		// here — this callback runs on the event thread inside
+		// libusb_handle_events(), and a blocking control transfer from that
+		// context can deadlock. A stalled bulk-OUT download is unrecoverable
+		// mid-stream anyway; just report it.
 
 		int n = ++bulk_out_error_count;
 		if (n <= 10 || n % 100 == 0)
@@ -353,9 +366,14 @@ int send_data_async(uint8_t endpoint, uint8_t *dataptr, int length, int timeout)
 		return LIBUSB_ERROR_NO_DEVICE;
 	}
 
+	int sc = ++bulk_out_submit_count;
+
 	// Backpressure. Bulk data must not be dropped (unlike ISO), so block until
 	// an in-flight slot frees rather than discarding the packet. Bail out if
 	// the device disappears (a completion callback set the flag) while waiting.
+	if (bulk_out_in_flight >= bulk_out_max_in_flight && verbose_level > 0)
+		fprintf(stderr, "[async] EP%02x backpressure wait: in_flight=%d (submit #%d)\n",
+			endpoint, bulk_out_in_flight.load(), sc);
 	while (bulk_out_in_flight >= bulk_out_max_in_flight) {
 		if (bulk_out_device_gone) {
 			delete[] dataptr;
@@ -387,6 +405,9 @@ int send_data_async(uint8_t endpoint, uint8_t *dataptr, int length, int timeout)
 	}
 
 	bulk_out_in_flight++;
+	if (verbose_level > 0)
+		fprintf(stderr, "[async] EP%02x submitted #%d len=%d in_flight=%d\n",
+			endpoint, sc, length, bulk_out_in_flight.load());
 	return LIBUSB_SUCCESS;
 }
 
