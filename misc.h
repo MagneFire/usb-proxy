@@ -27,6 +27,7 @@ extern bool reset_device_before_proxy;
 extern bool bmaxpacketsize0_must_greater_than_64;
 extern int iso_batch_size;
 extern int bulk_out_max_in_flight;
+extern bool drop_zero_len_out;
 extern bool gadget_is_musb;
 
 std::string hexToAscii(std::string input);

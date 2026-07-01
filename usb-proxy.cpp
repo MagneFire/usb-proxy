@@ -23,6 +23,12 @@ bool bmaxpacketsize0_must_greater_than_64 = true;
 bool auto_remap_endpoints = false;
 int iso_batch_size = ISO_BATCH_SIZE_DEFAULT;
 int bulk_out_max_in_flight = BULK_OUT_IN_FLIGHT_DEFAULT;
+// Drop zero-length OUT reads (host bulk transfer-terminator ZLPs) instead of
+// forwarding them to the device. On musb the OUT read is clamped to one packet,
+// so each read is re-chunked into its own libusb transfer; forwarding a ZLP then
+// injects a spurious 0-length transfer between length-framed protocol messages
+// (e.g. ADB), desyncing the device. Length-framed protocols don't need the ZLP.
+bool drop_zero_len_out = false;
 bool gadget_is_musb = false;
 enum usb_device_speed device_speed = USB_SPEED_HIGH;
 
@@ -598,6 +604,10 @@ int main(int argc, char **argv)
 		if (customized_config["bmaxpacketsize0_must_greater_than_64"] == false) {
 			printf("bmaxpacketsize0_must_greater_than_64 set to false\n");
 			bmaxpacketsize0_must_greater_than_64 = false;
+		}
+		if (customized_config.get("drop_zero_len_out", false).asBool()) {
+			printf("drop_zero_len_out enabled (host OUT ZLPs not forwarded)\n");
+			drop_zero_len_out = true;
 		}
 		if (customized_config.isMember("async_bulk_out_in_flight")) {
 			int v = customized_config["async_bulk_out_in_flight"].asInt();

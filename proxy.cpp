@@ -1003,6 +1003,21 @@ void *ep_loop_read(void *arg) {
 					transfer_type.c_str(), dir.c_str(), rv);
 			io.inner.length = rv;
 
+			// Optionally drop host bulk transfer-terminator ZLPs instead of
+			// forwarding them. The musb one-packet clamp makes us re-chunk each
+			// OUT read into its own libusb transfer, so a forwarded 0-length
+			// read becomes a spurious 0-length transfer to the device — landing
+			// between length-framed protocol messages (e.g. ADB WRTE payloads)
+			// and desyncing the device's reader. Length-framed protocols
+			// (ADB/fastboot) don't need the ZLP. Only applies to bulk OUT.
+			if (rv == 0 && drop_zero_len_out &&
+			    (ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK) {
+				if (verbose_level > 0)
+					printf("EP%x(%s_%s): dropping 0-length OUT (ZLP)\n",
+						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
+				continue;
+			}
+
 			if (injection_enabled)
 				injection(io, thread_info.device_bEndpointAddress, transfer_type);
 
