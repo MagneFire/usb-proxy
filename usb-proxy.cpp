@@ -23,6 +23,11 @@ bool bmaxpacketsize0_must_greater_than_64 = true;
 bool auto_remap_endpoints = false;
 int iso_batch_size = ISO_BATCH_SIZE_DEFAULT;
 int bulk_out_max_in_flight = BULK_OUT_IN_FLIGHT_DEFAULT;
+// Bulk-OUT gadget reads on musb: packets per read buffer (maxp * N, capped to
+// MAX_TRANSFER_SIZE). Default 1 = the historical one-packet clamp, required on
+// kernels without the musb requeue-flush fix. With a fixed kernel, 8 cuts the
+// per-packet ioctl overhead substantially.
+int musb_out_read_packets = 1;
 bool gadget_is_musb = false;
 enum usb_device_speed device_speed = USB_SPEED_HIGH;
 
@@ -142,6 +147,8 @@ void usage() {
 		ISO_BATCH_SIZE_MAX, ISO_BATCH_SIZE_DEFAULT);
 	printf("\t--bulk_out_in_flight N: async bulk-OUT transfers kept in flight (0=synchronous, max %d, default %d)\n\n",
 		BULK_OUT_IN_FLIGHT_MAX, BULK_OUT_IN_FLIGHT_DEFAULT);
+	printf("\t--musb_out_read_packets N: bulk-OUT packets per gadget read on musb (default 1;\n");
+	printf("\t                           >1 needs a kernel with the musb requeue-flush fix)\n");
 	printf("* If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.\n");
 	printf("* If `driver` not specified, `usb-proxy` will use `dummy_udc` as default driver.\n");
 	printf("* If both `vendor_id` and `product_id` not specified, `usb-proxy` will connect\n");
@@ -495,6 +502,7 @@ int main(int argc, char **argv)
 		{"auto_remap_endpoints", no_argument, &lopt, 10},
 		{"iso_batch_size", required_argument, &lopt, 11},
 		{"bulk_out_in_flight", required_argument, &lopt, 12},
+		{"musb_out_read_packets", required_argument, &lopt, 13},
 		{0, 0, 0, 0}
 	};
 	while ((opt = getopt_long(argc, argv, optstring, long_options, &loidx)) != -1) {
@@ -550,6 +558,10 @@ int main(int argc, char **argv)
 		case 12:
 			set_int_knob("bulk_out_in_flight", bulk_out_max_in_flight,
 				     std::stoi(optarg), 0, BULK_OUT_IN_FLIGHT_MAX);
+			break;
+		case 13:
+			set_int_knob("musb_out_read_packets", musb_out_read_packets,
+				     std::stoi(optarg), 1, MUSB_OUT_READ_PACKETS_MAX);
 			break;
 
 		default:
@@ -617,6 +629,8 @@ int main(int argc, char **argv)
 		}
 		cfg_int(customized_config, "async_bulk_out_in_flight",
 			bulk_out_max_in_flight, 0, BULK_OUT_IN_FLIGHT_MAX);
+		cfg_int(customized_config, "musb_out_read_packets",
+			musb_out_read_packets, 1, MUSB_OUT_READ_PACKETS_MAX);
 	}
 
 	while (connect_device(vendor_id, product_id)) {

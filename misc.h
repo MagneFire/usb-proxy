@@ -27,6 +27,9 @@ extern bool reset_device_before_proxy;
 extern bool bmaxpacketsize0_must_greater_than_64;
 extern int iso_batch_size;
 extern int bulk_out_max_in_flight;
+// Bulk-OUT packets per gadget read on musb (1 = the one-packet clamp).
+extern int musb_out_read_packets;
+#define MUSB_OUT_READ_PACKETS_MAX 64
 extern bool gadget_is_musb;
 
 std::string hexToAscii(std::string input);
