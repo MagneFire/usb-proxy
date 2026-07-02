@@ -274,7 +274,11 @@ public:
 	}
 };
 
+// Separate instances per direction: the host->device (OUT) and device->host
+// (IN) bulk streams are independent ADB transports and must not share parser
+// state. The EP address in each log line (0x0x=OUT, 0x8x=IN) tells them apart.
 static AdbBulkDiag adb_bulk_diag_state;
+static AdbBulkDiag adb_bulk_diag_in_state;
 
 static uint16_t find_udc_maxpacket_for_interface(uint8_t interface_number)
 {
@@ -1040,6 +1044,13 @@ void *ep_loop_write(void *arg) {
 					_exit(0);
 					break;
 				}
+				// send_data() only returns non-SUCCESS for fatal errors now
+				// (bulk OUT retries timeouts internally); any failure here
+				// means forwarded data was genuinely lost, so say so loudly.
+				if (rv != LIBUSB_SUCCESS)
+					fprintf(stderr, "EP%x(%s_%s): send_data failed rv=%d (%s), %d bytes lost\n",
+						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str(),
+						rv, libusb_strerror((libusb_error)rv), length);
 				delete[] data;
 			}
 		}
@@ -1174,6 +1185,19 @@ void *ep_loop_read(void *arg) {
 				// breaks the stream on musb). A genuine device ZLP arrives as
 				// LIBUSB_SUCCESS with nbytes == 0 and is still forwarded.
 				if (rv == LIBUSB_SUCCESS) {
+					// Mirror the OUT-side diagnostic on the IN stream so the
+					// log shows both halves of the ADB conversation (host
+					// WRTE/DATA vs device OKAY) — distinguishes "device never
+					// got the data" from "device's ack never reached the host".
+					if (adb_bulk_diag &&
+					    (ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK) {
+						if (nbytes > 0)
+							adb_bulk_diag_in_state.feed(ep.bEndpointAddress,
+										    (uint8_t *)data, nbytes);
+						else
+							adb_bulk_diag_in_state.zlp(ep.bEndpointAddress);
+					}
+
 					memcpy(io.data, data, nbytes);
 					io.inner.ep = ep_num;
 					io.inner.flags = 0;

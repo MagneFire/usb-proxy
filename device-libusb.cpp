@@ -250,38 +250,59 @@ int send_data(uint8_t endpoint, uint8_t attributes, uint8_t *dataptr,
 	int attempt = 0;
 	int result = LIBUSB_SUCCESS;
 
-	bool incomplete_transfer = false;
-
 	switch (attributes & USB_ENDPOINT_XFERTYPE_MASK) {
 	case USB_ENDPOINT_XFER_CONTROL:
 		fprintf(stderr, "Can't send on a control endpoint.\n");
 		break;
-	case USB_ENDPOINT_XFER_BULK:
-		do {
-			result = libusb_bulk_transfer(dev_handle, endpoint, dataptr, length, &transferred, timeout);
-			//TODO retry transfer if incomplete
-			if (transferred != length) {
-				fprintf(stderr, "Incomplete Bulk transfer on EP%02x for attempt %d. length(%d), transferred(%d)\n",
-					endpoint, attempt, length, transferred);
-				incomplete_transfer = true;
-			}
-			if (result == LIBUSB_SUCCESS) {
-				if (incomplete_transfer)
-					printf("Resent Bulk transfer on EP%02x for attempt %d. length(%d), transferred(%d)\n",
-						endpoint, attempt, length, transferred);
-				if (verbose_level > 2)
-					printf("Sent %d bytes (Bulk) to EP%02x\n", transferred, endpoint);
+	case USB_ENDPOINT_XFER_BULK: {
+		// Bulk data must never be dropped. The gadget side already ACKed
+		// this data to the host, so the host will not resend it; giving up
+		// here permanently desyncs a length-framed stream (ADB/fastboot
+		// deadlock). A real host controller never times out a NAKing bulk
+		// endpoint — it just keeps retrying — so do the same: resend only
+		// the unsent tail, indefinitely, until the device accepts it or
+		// goes away. Meanwhile the gadget NAKs the host, which is correct
+		// end-to-end flow control.
+		int off = 0;
+		while (true) {
+			transferred = 0;
+			result = libusb_bulk_transfer(dev_handle, endpoint, dataptr + off,
+						length - off, &transferred, timeout);
+			off += transferred;
+			if (result == LIBUSB_SUCCESS && off >= length)
+				break;
+			if (result == LIBUSB_SUCCESS || result == LIBUSB_ERROR_TIMEOUT) {
+				// Timed out (device NAKing) or a short sync write.
+				attempt++;
+				if (attempt <= 5 || attempt % 60 == 0)
+					fprintf(stderr, "[outdev] EP%02x bulk OUT %s, retrying tail: sent %d/%d, attempt %d\n",
+						endpoint,
+						result == LIBUSB_ERROR_TIMEOUT ? "timeout" : "short write",
+						off, length, attempt);
+				if (please_stop_eps)
+					break;
+				continue;
 			}
 			// Only a genuine stall (PIPE) is a halt to clear. Clearing on a
 			// timeout resets the data toggle, and retrying a timed-out OUT
 			// after that reset risks duplicating the transfer.
-			if (result == LIBUSB_ERROR_PIPE)
+			if (result == LIBUSB_ERROR_PIPE) {
 				libusb_clear_halt(dev_handle, endpoint);
-
-			attempt++;
-		} while ((result == LIBUSB_ERROR_PIPE || transferred != length)
-					&& attempt < MAX_ATTEMPTS);
+				if (++attempt >= MAX_ATTEMPTS)
+					break;
+				continue;
+			}
+			break;	// fatal: NO_DEVICE, IO, ...
+		}
+		if (result == LIBUSB_SUCCESS) {
+			if (attempt)
+				fprintf(stderr, "[outdev] EP%02x bulk OUT recovered after %d retries (%d bytes)\n",
+					endpoint, attempt, length);
+			if (verbose_level > 2)
+				printf("Sent %d bytes (Bulk) to EP%02x\n", off, endpoint);
+		}
 		break;
+	}
 	case USB_ENDPOINT_XFER_INT:
 		result = libusb_interrupt_transfer(dev_handle, endpoint, dataptr, length, &transferred, timeout);
 
