@@ -29,6 +29,7 @@ int bulk_out_max_in_flight = BULK_OUT_IN_FLIGHT_DEFAULT;
 // injects a spurious 0-length transfer between length-framed protocol messages
 // (e.g. ADB), desyncing the device. Length-framed protocols don't need the ZLP.
 bool drop_zero_len_out = false;
+bool adb_bulk_diag = false;
 bool gadget_is_musb = false;
 enum usb_device_speed device_speed = USB_SPEED_HIGH;
 
@@ -127,6 +128,7 @@ void usage() {
 		ISO_BATCH_SIZE_MAX, ISO_BATCH_SIZE_DEFAULT);
 	printf("\t--bulk_out_in_flight N: async bulk-OUT transfers kept in flight (0=synchronous, max %d, default %d)\n\n",
 		BULK_OUT_IN_FLIGHT_MAX, BULK_OUT_IN_FLIGHT_DEFAULT);
+	printf("\t--adb_bulk_diag: log ADB/file-sync DATA progress on bulk OUT (diagnostic only)\n");
 	printf("* If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.\n");
 	printf("* If `driver` not specified, `usb-proxy` will use `dummy_udc` as default driver.\n");
 	printf("* If both `vendor_id` and `product_id` not specified, `usb-proxy` will connect\n");
@@ -454,6 +456,9 @@ int setup_host_usb_desc() {
 
 int main(int argc, char **argv)
 {
+	setvbuf(stdout, NULL, _IONBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
+
 	const char *device = "dummy_udc.0";
 	const char *driver = "dummy_udc";
 	int vendor_id = -1;
@@ -480,6 +485,7 @@ int main(int argc, char **argv)
 		{"auto_remap_endpoints", no_argument, &lopt, 10},
 		{"iso_batch_size", required_argument, &lopt, 11},
 		{"bulk_out_in_flight", required_argument, &lopt, 12},
+		{"adb_bulk_diag", no_argument, &lopt, 13},
 		{0, 0, 0, 0}
 	};
 	while ((opt = getopt_long(argc, argv, optstring, long_options, &loidx)) != -1) {
@@ -540,6 +546,10 @@ int main(int argc, char **argv)
 				bulk_out_max_in_flight = BULK_OUT_IN_FLIGHT_MAX;
 			printf("Bulk-OUT in-flight set to %d%s\n", bulk_out_max_in_flight,
 				bulk_out_max_in_flight == 0 ? " (synchronous)" : "");
+			break;
+		case 13:
+			adb_bulk_diag = true;
+			printf("ADB bulk diagnostic enabled\n");
 			break;
 
 		default:
@@ -618,6 +628,10 @@ int main(int argc, char **argv)
 			bulk_out_max_in_flight = v;
 			printf("async_bulk_out_in_flight set to %d%s\n", v,
 				v == 0 ? " (synchronous)" : "");
+		}
+		if (customized_config.get("adb_bulk_diag", false).asBool()) {
+			printf("adb_bulk_diag enabled (ADB/file-sync bulk OUT logging)\n");
+			adb_bulk_diag = true;
 		}
 	}
 

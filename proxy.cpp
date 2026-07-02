@@ -1,6 +1,7 @@
 #include <vector>
 #include <algorithm>
 #include <map>
+#include <deque>
 
 #include "host-raw-gadget.h"
 #include "device-libusb.h"
@@ -24,6 +25,256 @@ extern "C" {
 #define UVC_PROBE_MAX_PAYLOAD_OFFSET	22
 
 extern bool auto_remap_endpoints;
+
+static uint32_t le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] |
+		((uint32_t)p[1] << 8) |
+		((uint32_t)p[2] << 16) |
+		((uint32_t)p[3] << 24);
+}
+
+static uint32_t adb_cmd(const char s[4])
+{
+	return (uint32_t)(uint8_t)s[0] |
+		((uint32_t)(uint8_t)s[1] << 8) |
+		((uint32_t)(uint8_t)s[2] << 16) |
+		((uint32_t)(uint8_t)s[3] << 24);
+}
+
+static void cmd_to_string(uint32_t cmd, char out[5])
+{
+	out[0] = cmd & 0xff;
+	out[1] = (cmd >> 8) & 0xff;
+	out[2] = (cmd >> 16) & 0xff;
+	out[3] = (cmd >> 24) & 0xff;
+	out[4] = '\0';
+}
+
+class AdbSyncDiag {
+	enum SyncState {
+		SYNC_TAG,
+		SYNC_LEN,
+		SYNC_DATA,
+		SYNC_DONE_VALUE,
+	};
+
+	SyncState state = SYNC_TAG;
+	std::deque<uint8_t> tag;
+	uint8_t lenbuf[4] = {};
+	int lenpos = 0;
+	uint32_t data_len = 0;
+	uint32_t data_seen = 0;
+	uint64_t chunk_no = 0;
+
+	void reset_to_tag()
+	{
+		state = SYNC_TAG;
+		tag.clear();
+		lenpos = 0;
+		data_len = 0;
+		data_seen = 0;
+	}
+
+	void feed_tag_byte(uint8_t b, uint64_t stream_offset)
+	{
+		tag.push_back(b);
+		if (tag.size() < 4)
+			return;
+		while (tag.size() > 4)
+			tag.pop_front();
+
+		uint8_t t[4] = { tag[0], tag[1], tag[2], tag[3] };
+		if (!memcmp(t, "DATA", 4)) {
+			state = SYNC_LEN;
+			lenpos = 0;
+			tag.clear();
+			return;
+		}
+		if (!memcmp(t, "DONE", 4)) {
+			state = SYNC_DONE_VALUE;
+			lenpos = 0;
+			tag.clear();
+			fprintf(stderr, "[adbdiag] sync DONE tag at stream=%llu\n",
+				(unsigned long long)(stream_offset - 3));
+			return;
+		}
+		if (!memcmp(t, "OKAY", 4) || !memcmp(t, "FAIL", 4)) {
+			char name[5] = { (char)t[0], (char)t[1], (char)t[2], (char)t[3], '\0' };
+			fprintf(stderr, "[adbdiag] sync %s tag at stream=%llu\n",
+				name, (unsigned long long)(stream_offset - 3));
+			tag.clear();
+			return;
+		}
+
+		tag.pop_front();
+	}
+
+public:
+	void gap(const char *reason, uint64_t stream_offset)
+	{
+		if (state == SYNC_DATA) {
+			fprintf(stderr,
+				"[adbdiag] DATA #%llu interrupted by %s at stream=%llu expected=%u observed=%u remaining=%u\n",
+				(unsigned long long)chunk_no, reason,
+				(unsigned long long)stream_offset, data_len, data_seen,
+				data_len - data_seen);
+		} else if (state == SYNC_LEN) {
+			fprintf(stderr,
+				"[adbdiag] DATA #%llu length interrupted by %s at stream=%llu bytes_read=%d/4\n",
+				(unsigned long long)(chunk_no + 1), reason,
+				(unsigned long long)stream_offset, lenpos);
+		}
+	}
+
+	void feed(uint8_t b, uint64_t stream_offset)
+	{
+		switch (state) {
+		case SYNC_TAG:
+			feed_tag_byte(b, stream_offset);
+			break;
+		case SYNC_LEN:
+			lenbuf[lenpos++] = b;
+			if (lenpos == 4) {
+				data_len = le32(lenbuf);
+				data_seen = 0;
+				chunk_no++;
+				fprintf(stderr, "[adbdiag] DATA #%llu expected=%u stream=%llu\n",
+					(unsigned long long)chunk_no, data_len,
+					(unsigned long long)(stream_offset - 7));
+				if (data_len > 1024 * 1024) {
+					fprintf(stderr, "[adbdiag] DATA #%llu invalid length=%u, resyncing\n",
+						(unsigned long long)chunk_no, data_len);
+					reset_to_tag();
+				} else if (data_len == 0) {
+					fprintf(stderr, "[adbdiag] DATA #%llu complete observed=0\n",
+						(unsigned long long)chunk_no);
+					reset_to_tag();
+				} else {
+					state = SYNC_DATA;
+				}
+			}
+			break;
+		case SYNC_DATA:
+			if (b != 0xaa) {
+				uint32_t remaining = data_len - data_seen;
+				fprintf(stderr,
+					"[adbdiag] DATA #%llu short/non-aa at stream=%llu expected=%u observed=%u remaining=%u byte=0x%02x\n",
+					(unsigned long long)chunk_no,
+					(unsigned long long)stream_offset,
+					data_len, data_seen, remaining, b);
+				reset_to_tag();
+				feed_tag_byte(b, stream_offset);
+				break;
+			}
+			data_seen++;
+			if (data_seen == data_len) {
+				fprintf(stderr, "[adbdiag] DATA #%llu complete observed=%u\n",
+					(unsigned long long)chunk_no, data_seen);
+				reset_to_tag();
+			}
+			break;
+		case SYNC_DONE_VALUE:
+			lenbuf[lenpos++] = b;
+			if (lenpos == 4) {
+				fprintf(stderr, "[adbdiag] sync DONE mtime=%u\n", le32(lenbuf));
+				reset_to_tag();
+			}
+			break;
+		}
+	}
+};
+
+class AdbBulkDiag {
+	std::deque<uint8_t> header;
+	uint32_t payload_remaining = 0;
+	uint32_t current_cmd = 0;
+	uint64_t stream_offset = 0;
+	uint64_t msg_no = 0;
+	AdbSyncDiag sync;
+
+	bool parse_header(uint8_t out[24], uint32_t *cmd, uint32_t *length)
+	{
+		for (int i = 0; i < 24; i++)
+			out[i] = header[i];
+
+		*cmd = le32(out);
+		*length = le32(out + 12);
+		uint32_t magic = le32(out + 20);
+		if (magic != (*cmd ^ 0xffffffffU))
+			return false;
+		if (*length > 1024 * 1024)
+			return false;
+		return true;
+	}
+
+public:
+	void zlp(uint8_t endpoint)
+	{
+		static const uint32_t WRTE = adb_cmd("WRTE");
+
+		if (!payload_remaining)
+			return;
+
+		char name[5];
+		cmd_to_string(current_cmd, name);
+		fprintf(stderr,
+			"[adbdiag] EP%02x ZLP while ADB %s #%llu payload incomplete: remaining=%u stream=%llu\n",
+			endpoint, name, (unsigned long long)msg_no,
+			payload_remaining, (unsigned long long)stream_offset);
+		if (current_cmd == WRTE)
+			sync.gap("host ZLP before ADB payload completion", stream_offset);
+	}
+
+	void feed(uint8_t endpoint, const uint8_t *data, int length)
+	{
+		static const uint32_t WRTE = adb_cmd("WRTE");
+
+		for (int i = 0; i < length; i++, stream_offset++) {
+			uint8_t b = data[i];
+
+			if (payload_remaining > 0) {
+				if (current_cmd == WRTE)
+					sync.feed(b, stream_offset);
+				payload_remaining--;
+				if (payload_remaining == 0) {
+					char name[5];
+					cmd_to_string(current_cmd, name);
+					fprintf(stderr, "[adbdiag] ADB %s #%llu payload end stream=%llu\n",
+						name, (unsigned long long)msg_no,
+						(unsigned long long)stream_offset);
+				}
+				continue;
+			}
+
+			header.push_back(b);
+			if (header.size() < 24)
+				continue;
+			while (header.size() > 24)
+				header.pop_front();
+
+			uint8_t hdr[24];
+			uint32_t cmd;
+			uint32_t payload_len;
+			if (!parse_header(hdr, &cmd, &payload_len)) {
+				header.pop_front();
+				continue;
+			}
+
+			current_cmd = cmd;
+			payload_remaining = payload_len;
+			msg_no++;
+			char name[5];
+			cmd_to_string(cmd, name);
+			fprintf(stderr, "[adbdiag] EP%02x ADB %s #%llu len=%u stream=%llu\n",
+				endpoint, name, (unsigned long long)msg_no, payload_len,
+				(unsigned long long)(stream_offset - 23));
+			header.clear();
+		}
+	}
+};
+
+static AdbBulkDiag adb_bulk_diag_state;
 
 static uint16_t find_udc_maxpacket_for_interface(uint8_t interface_number)
 {
@@ -1002,6 +1253,15 @@ void *ep_loop_read(void *arg) {
 			printf("EP%x(%s_%s): read %d bytes from host\n", ep.bEndpointAddress,
 					transfer_type.c_str(), dir.c_str(), rv);
 			io.inner.length = rv;
+
+			if (adb_bulk_diag &&
+			    (ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK &&
+			    rv > 0)
+				adb_bulk_diag_state.feed(ep.bEndpointAddress, (uint8_t *)io.data, rv);
+			else if (adb_bulk_diag &&
+				 (ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK &&
+				 rv == 0)
+				adb_bulk_diag_state.zlp(ep.bEndpointAddress);
 
 			// Optionally drop host bulk transfer-terminator ZLPs instead of
 			// forwarding them. The musb one-packet clamp makes us re-chunk each
