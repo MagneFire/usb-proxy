@@ -1242,16 +1242,29 @@ void *ep_loop_read(void *arg) {
 			// then triggers EMSGSIZE (-90) when forwarding to the physical device.
 			//
 			// musb-hdrc has the same buffer-size sensitivity on bulk/interrupt
-			// OUT endpoints: with a multi-packet buffer it accepts the first
-			// transfer but then stalls/NAKs subsequent OUT data (e.g. the host
-			// sends an ADB CNXN header but its follow-up payload never arrives),
-			// so clamp every OUT read to one packet on musb. Other UDCs (dwc2)
-			// have a large RX FIFO and keep the full buffer for throughput.
-			if ((ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_ISOC ||
-			    gadget_is_musb)
+			// OUT endpoints: with a multi-packet buffer it used to accept the
+			// first transfer but then stall/NAK subsequent OUT data (e.g. the
+			// host sends an ADB CNXN header but its follow-up payload never
+			// arrives), so OUT reads default to one packet on musb. That
+			// stall is most likely the kernel musb requeue-flush bug (fixed
+			// by the appliance's 0001 patch); with a fixed kernel,
+			// musb_out_read_packets (config/CLI, default 1 = the proven
+			// clamp) opts bulk OUT into maxp*N read buffers to cut the
+			// per-packet ioctl overhead. Interrupt OUT stays at one packet.
+			// Other UDCs (dwc2) have a large RX FIFO and keep the full
+			// buffer for throughput.
+			if ((ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_ISOC) {
 				io.inner.length = usb_endpoint_maxp(&ep);
-			else
+			} else if (gadget_is_musb) {
+				unsigned int len = usb_endpoint_maxp(&ep);
+				if ((ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK)
+					len *= musb_out_read_packets;
+				if (len > sizeof(io.data))
+					len = sizeof(io.data);
+				io.inner.length = len;
+			} else {
 				io.inner.length = sizeof(io.data);
+			}
 
 			int rv = usb_raw_ep_read(fd, (struct usb_raw_ep_io *)&io);
 			if (rv < 0 && errno == ESHUTDOWN) {

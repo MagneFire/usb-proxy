@@ -30,6 +30,11 @@ int bulk_out_max_in_flight = BULK_OUT_IN_FLIGHT_DEFAULT;
 // (e.g. ADB), desyncing the device. Length-framed protocols don't need the ZLP.
 bool drop_zero_len_out = false;
 bool adb_bulk_diag = false;
+// Bulk-OUT gadget reads on musb: packets per read buffer (maxp * N, capped to
+// MAX_TRANSFER_SIZE). Default 1 = the historical one-packet clamp, required on
+// kernels without the musb requeue-flush fix. With a fixed kernel, 8 cuts the
+// per-packet ioctl overhead substantially.
+int musb_out_read_packets = 1;
 bool gadget_is_musb = false;
 enum usb_device_speed device_speed = USB_SPEED_HIGH;
 
@@ -129,6 +134,8 @@ void usage() {
 	printf("\t--bulk_out_in_flight N: async bulk-OUT transfers kept in flight (0=synchronous, max %d, default %d)\n\n",
 		BULK_OUT_IN_FLIGHT_MAX, BULK_OUT_IN_FLIGHT_DEFAULT);
 	printf("\t--adb_bulk_diag: log ADB/file-sync DATA progress on bulk OUT (diagnostic only)\n");
+	printf("\t--musb_out_read_packets N: bulk-OUT packets per gadget read on musb (default 1;\n");
+	printf("\t                           >1 needs a kernel with the musb requeue-flush fix)\n");
 	printf("* If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.\n");
 	printf("* If `driver` not specified, `usb-proxy` will use `dummy_udc` as default driver.\n");
 	printf("* If both `vendor_id` and `product_id` not specified, `usb-proxy` will connect\n");
@@ -486,6 +493,7 @@ int main(int argc, char **argv)
 		{"iso_batch_size", required_argument, &lopt, 11},
 		{"bulk_out_in_flight", required_argument, &lopt, 12},
 		{"adb_bulk_diag", no_argument, &lopt, 13},
+		{"musb_out_read_packets", required_argument, &lopt, 14},
 		{0, 0, 0, 0}
 	};
 	while ((opt = getopt_long(argc, argv, optstring, long_options, &loidx)) != -1) {
@@ -550,6 +558,14 @@ int main(int argc, char **argv)
 		case 13:
 			adb_bulk_diag = true;
 			printf("ADB bulk diagnostic enabled\n");
+			break;
+		case 14:
+			musb_out_read_packets = std::stoi(optarg);
+			if (musb_out_read_packets < 1)
+				musb_out_read_packets = 1;
+			if (musb_out_read_packets > 64)
+				musb_out_read_packets = 64;
+			printf("musb bulk-OUT read packets set to %d\n", musb_out_read_packets);
 			break;
 
 		default:
@@ -632,6 +648,15 @@ int main(int argc, char **argv)
 		if (customized_config.get("adb_bulk_diag", false).asBool()) {
 			printf("adb_bulk_diag enabled (ADB/file-sync bulk OUT logging)\n");
 			adb_bulk_diag = true;
+		}
+		if (customized_config.isMember("musb_out_read_packets")) {
+			int v = customized_config["musb_out_read_packets"].asInt();
+			if (v < 1)
+				v = 1;
+			if (v > 64)
+				v = 64;
+			musb_out_read_packets = v;
+			printf("musb_out_read_packets set to %d\n", v);
 		}
 	}
 
