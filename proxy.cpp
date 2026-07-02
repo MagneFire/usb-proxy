@@ -789,6 +789,13 @@ void *ep_loop_write(void *arg) {
 					_exit(0);
 					break;
 				}
+				// send_data() only returns non-SUCCESS for fatal errors now
+				// (bulk OUT retries timeouts internally); any failure here
+				// means forwarded data was genuinely lost, so say so loudly.
+				if (rv != LIBUSB_SUCCESS)
+					fprintf(stderr, "EP%x(%s_%s): send_data failed rv=%d (%s), %d bytes lost\n",
+						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str(),
+						rv, libusb_strerror((libusb_error)rv), length);
 				delete[] data;
 			}
 		}
