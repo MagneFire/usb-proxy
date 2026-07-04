@@ -3,6 +3,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <sys/prctl.h>
+
 #include "host-raw-gadget.h"
 #include "device-libusb.h"
 #include "proxy.h"
@@ -476,6 +478,13 @@ int setup_host_usb_desc() {
 
 int main(int argc, char **argv)
 {
+	setvbuf(stdout, NULL, _IONBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
+
+	// The default 50us timer slack inflates every short sleep/bounded wait on
+	// the forwarding paths, and those waits sit on the per-transfer round trip.
+	prctl(PR_SET_TIMERSLACK, 1000UL);
+
 	const char *device = "dummy_udc.0";
 	const char *driver = "dummy_udc";
 	int vendor_id = -1;

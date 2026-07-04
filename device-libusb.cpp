@@ -1,4 +1,7 @@
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
 
 #include "device-libusb.h"
 
@@ -338,8 +341,15 @@ static std::atomic<int> bulk_out_error_count(0);
 static std::atomic<int> bulk_out_submit_count(0);
 static std::atomic<int> bulk_out_complete_count(0);
 
+// Wakes the backpressure wait in send_data_async() as soon as a completion
+// frees a slot (instead of a 50us sleep-poll). Bounded wait_for on the waiter
+// side keeps a missed notify harmless.
+static std::mutex bulk_out_slot_mutex;
+static std::condition_variable bulk_out_slot_cv;
+
 static void bulk_out_callback(struct libusb_transfer *transfer) {
 	bulk_out_in_flight--;
+	bulk_out_slot_cv.notify_one();
 
 	int cc = ++bulk_out_complete_count;
 	if (verbose_level > 0)
@@ -400,7 +410,8 @@ int send_data_async(uint8_t endpoint, uint8_t *dataptr, int length, int timeout)
 			delete[] dataptr;
 			return LIBUSB_ERROR_NO_DEVICE;
 		}
-		usleep(50);
+		std::unique_lock<std::mutex> lock(bulk_out_slot_mutex);
+		bulk_out_slot_cv.wait_for(lock, std::chrono::milliseconds(1));
 	}
 
 	struct libusb_transfer *transfer = libusb_alloc_transfer(0);
