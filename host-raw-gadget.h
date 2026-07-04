@@ -118,6 +118,10 @@ struct thread_info {
 	// which sat directly on the ADB WRTE->OKAY round trip (twice per cycle).
 	std::condition_variable		*data_cv;
 	std::atomic<bool>		*please_stop;
+	// For a bulk OUT endpoint: the paired bulk IN endpoint's (persistent)
+	// thread_info on the same altsetting, so the ADB ACK accelerator can
+	// queue fabricated OKAYs toward the host. NULL otherwise.
+	struct thread_info		*peer_in;
 };
 
 struct raw_gadget_endpoint {

@@ -32,6 +32,10 @@ int bulk_out_max_in_flight = BULK_OUT_IN_FLIGHT_DEFAULT;
 // (e.g. ADB), desyncing the device. Length-framed protocols don't need the ZLP.
 bool drop_zero_len_out = false;
 bool adb_bulk_diag = false;
+// ADB ACK accelerator: locally acknowledge host WRTEs and swallow the device's
+// real OKAYs, hiding the proxy's store-and-forward hop from ADB's one-WRTE-
+// in-flight flow control. Opt-in; see the AdbAckAccel comment in proxy.cpp.
+bool adb_ack_accel = false;
 // Bulk-OUT gadget reads on musb: packets per read buffer (maxp * N, capped to
 // MAX_TRANSFER_SIZE). Default 1 = the historical one-packet clamp, required on
 // kernels without the musb requeue-flush fix. With a fixed kernel, 8 cuts the
@@ -136,6 +140,8 @@ void usage() {
 	printf("\t--bulk_out_in_flight N: async bulk-OUT transfers kept in flight (0=synchronous, max %d, default %d)\n\n",
 		BULK_OUT_IN_FLIGHT_MAX, BULK_OUT_IN_FLIGHT_DEFAULT);
 	printf("\t--adb_bulk_diag: log ADB/file-sync DATA progress on bulk OUT (diagnostic only)\n");
+	printf("\t--adb_ack_accel: acknowledge host ADB WRTEs locally (hides the proxy hop from\n");
+	printf("\t                 ADB flow control; the file-sync DONE handshake stays end-to-end)\n");
 	printf("\t--musb_out_read_packets N: bulk-OUT packets per gadget read on musb (default 1;\n");
 	printf("\t                           >1 needs a kernel with the musb requeue-flush fix)\n");
 	printf("* If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.\n");
@@ -500,6 +506,7 @@ int main(int argc, char **argv)
 		{"bulk_out_in_flight", required_argument, &lopt, 12},
 		{"adb_bulk_diag", no_argument, &lopt, 13},
 		{"musb_out_read_packets", required_argument, &lopt, 14},
+		{"adb_ack_accel", no_argument, &lopt, 15},
 		{0, 0, 0, 0}
 	};
 	while ((opt = getopt_long(argc, argv, optstring, long_options, &loidx)) != -1) {
@@ -572,6 +579,10 @@ int main(int argc, char **argv)
 			if (musb_out_read_packets > 64)
 				musb_out_read_packets = 64;
 			printf("musb bulk-OUT read packets set to %d\n", musb_out_read_packets);
+			break;
+		case 15:
+			adb_ack_accel = true;
+			printf("ADB ACK accelerator enabled\n");
 			break;
 
 		default:
@@ -663,6 +674,10 @@ int main(int argc, char **argv)
 				v = 64;
 			musb_out_read_packets = v;
 			printf("musb_out_read_packets set to %d\n", v);
+		}
+		if (customized_config.get("adb_ack_accel", false).asBool()) {
+			printf("adb_ack_accel enabled (local WRTE acks; device OKAYs swallowed)\n");
+			adb_ack_accel = true;
 		}
 	}
 

@@ -29,6 +29,7 @@ extern int iso_batch_size;
 extern int bulk_out_max_in_flight;
 extern bool drop_zero_len_out;
 extern bool adb_bulk_diag;
+extern bool adb_ack_accel;
 extern int musb_out_read_packets;
 extern bool gadget_is_musb;
 

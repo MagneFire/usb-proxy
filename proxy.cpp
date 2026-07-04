@@ -34,6 +34,14 @@ static uint32_t le32(const uint8_t *p)
 		((uint32_t)p[3] << 24);
 }
 
+static void put_le32(uint8_t *p, uint32_t v)
+{
+	p[0] = v & 0xff;
+	p[1] = (v >> 8) & 0xff;
+	p[2] = (v >> 16) & 0xff;
+	p[3] = (v >> 24) & 0xff;
+}
+
 static uint32_t adb_cmd(const char s[4])
 {
 	return (uint32_t)(uint8_t)s[0] |
@@ -279,6 +287,352 @@ public:
 // state. The EP address in each log line (0x0x=OUT, 0x8x=IN) tells them apart.
 static AdbBulkDiag adb_bulk_diag_state;
 static AdbBulkDiag adb_bulk_diag_in_state;
+
+// ---- ADB ACK accelerator (--adb_ack_accel) ---------------------------------
+//
+// A legacy ADB transport (as negotiated by old adbd, e.g. Wear OS 9 watches)
+// allows one outstanding WRTE per stream: the host won't send the next 4KB
+// payload until the device's A_OKAY comes back. Push throughput is therefore
+// 4096 / round-trip, and the proxy's store-and-forward hop roughly triples
+// the round trip (~0.45ms direct -> ~1.3ms), i.e. ~9 MB/s drops to ~3 MB/s
+// regardless of datapath bandwidth. ADB delayed-ack would fix this properly
+// but needs a much newer adbd than such devices have.
+//
+// The accelerator restores the direct-connection round trip by acking WRTEs
+// locally: as soon as a host WRTE's header has been read from the gadget (the
+// payload is committed and follows on the same pipe), a fabricated A_OKAY is
+// queued toward the host, and the device's real A_OKAYs for that stream pair
+// are swallowed. The device's acks can NOT be count-matched one-per-WRTE:
+// old adbd defers READY while a stream's buffer is backed up and acks the
+// whole backlog with a single READY (see PairState below), so bookkeeping is
+// credit-based, not FIFO-matched.
+//
+// Why this is safe(ish):
+// - Transport OKAYs are pure flow control. The file-sync protocol's own
+//   DONE -> OKAY/FAIL handshake rides in a device->host WRTE and passes
+//   through untouched, so "adb push" success/failure still reflects what
+//   adbd actually received and wrote. The window where the host's view can
+//   run ahead of the device's acks is capped (ACK_ACCEL_MAX_AHEAD spoofs
+//   since the device's last real OKAY); past that the spoof is withheld and
+//   the host waits on real flow control.
+// - Device-side backpressure is unaffected: bounded async in-flight URBs,
+//   bounded gadget-side queue, musb NAKs the host beyond that.
+// - Fabricated OKAYs are only inserted at device->host message boundaries,
+//   so they can never split another message's header/payload sequence.
+// - Fail-open: any framing surprise (unparseable header, or an OKAY that
+//   doesn't arrive as a standalone 24-byte read while swallows are owed)
+//   permanently disables all meddling for the session and everything is
+//   forwarded verbatim; a CNXN (new ADB session) clears stream bookkeeping.
+//
+// Assumes a single proxied bulk IN/OUT pair speaks ADB (true for these
+// watches). A second bulk interface feeding non-ADB data would trip the
+// framing check and fail open — correct, just without the speedup.
+#define ACK_ACCEL_MAX_AHEAD 8
+
+class AdbAckAccel {
+	struct Parser {
+		uint8_t hdr[24];
+		unsigned int hdr_have = 0;
+		uint32_t payload_remaining = 0;
+		uint32_t cmd = 0, arg0 = 0, arg1 = 0;
+
+		bool at_boundary() const { return hdr_have == 0 && payload_remaining == 0; }
+		void reset() { hdr_have = 0; payload_remaining = 0; }
+	};
+
+	std::mutex mtx;
+	bool dead = false;
+	Parser out;	// host -> device stream
+	Parser in;	// device -> host stream
+	// Per stream pair (host id, device id) we have spoofed on. The device's
+	// real OKAYs can NOT be count-matched to WRTEs: old adbd defers its READY
+	// while a stream's buffer is backed up (e.g. the transport thread pauses
+	// to spawn a shell service) and then acknowledges the whole backlog with
+	// a single READY once it drains — acks are an edge-triggered "I have room
+	// again" signal, not one-per-WRTE (observed on hardware: 9 WRTEs in,
+	// 1 OKAY back). So per pair we keep a spoof-credit counter: spoof freely
+	// while credits last; at zero, hold the spoof (the host just waits — real
+	// flow control takes over); ANY real OKAY for the pair means the device
+	// drained its buffer, so swallow it, refill the credits and release held
+	// spoofs.
+	struct PairState {
+		int tokens = ACK_ACCEL_MAX_AHEAD;
+		std::deque<usb_raw_transfer_io> held;
+	};
+	std::map<std::pair<uint32_t, uint32_t>, PairState> pairs;
+	// Fabricated OKAYs waiting for the device->host stream to reach a
+	// message boundary before they may be inserted.
+	std::deque<usb_raw_transfer_io> pending;
+	uint64_t spoofed = 0, swallowed = 0;
+
+	// Lock order everywhere: mtx, then the endpoint queue's data_mutex.
+
+	void die(const char *why)
+	{
+		if (!dead)
+			fprintf(stderr, "[ackaccel] DISABLED for this session: %s "
+				"(forwarding verbatim; spoofed=%llu swallowed=%llu)\n",
+				why, (unsigned long long)spoofed,
+				(unsigned long long)swallowed);
+		dead = true;
+		pairs.clear();
+		pending.clear();
+	}
+
+	void clear_streams()
+	{
+		pairs.clear();
+		pending.clear();
+	}
+
+	static bool parse_hdr(const uint8_t *p, uint32_t *cmd, uint32_t *arg0,
+			      uint32_t *arg1, uint32_t *len)
+	{
+		*cmd = le32(p);
+		*arg0 = le32(p + 4);
+		*arg1 = le32(p + 8);
+		*len = le32(p + 12);
+		uint32_t magic = le32(p + 20);
+		return magic == (*cmd ^ 0xffffffffU) && *len <= 1024 * 1024;
+	}
+
+	void enqueue_to(struct thread_info *ti, const usb_raw_transfer_io &io)
+	{
+		ti->data_mutex->lock();
+		ti->data_queue->push_back(io);
+		ti->data_mutex->unlock();
+		ti->data_cv->notify_all();
+	}
+
+	void flush_pending(struct thread_info *in_ti)
+	{
+		if (verbose_level > 0 && !pending.empty())
+			fprintf(stderr, "[ackaccel] flush %zu deferred spoof(s)\n",
+				pending.size());
+		while (!pending.empty()) {
+			enqueue_to(in_ti, pending.front());
+			pending.pop_front();
+		}
+	}
+
+	void on_wrte_complete(struct thread_info *out_ti)
+	{
+		static const uint32_t OKAY = adb_cmd("OKAY");
+		auto key = std::make_pair(out.arg0, out.arg1);
+		PairState &st = pairs[key];
+
+		struct usb_raw_transfer_io io;
+		memset(&io.inner, 0, sizeof(io.inner));
+		io.inner.ep = out_ti->peer_in->ep_num;
+		io.inner.flags = 0;
+		io.inner.length = 24;
+		uint8_t *p = (uint8_t *)io.data;
+		put_le32(p, OKAY);
+		put_le32(p + 4, out.arg1);	/* device-side stream id */
+		put_le32(p + 8, out.arg0);	/* host-side stream id */
+		put_le32(p + 12, 0);
+		put_le32(p + 16, 0);
+		put_le32(p + 20, OKAY ^ 0xffffffffU);
+
+		if (st.tokens <= 0) {
+			// Spoof credit exhausted: the device hasn't signalled room
+			// since ACK_ACCEL_MAX_AHEAD spoofs. Hold the ack; the host
+			// stalls exactly as without the accelerator until the
+			// device's next real OKAY releases it. (Window 1 means at
+			// most one WRTE arrives after we withhold, so this stays
+			// short.)
+			fprintf(stderr, "[ackaccel] hold: (%u,%u) out of spoof credit, awaiting device OKAY\n",
+				out.arg0, out.arg1);
+			st.held.push_back(io);
+			return;
+		}
+		st.tokens--;
+		spoofed++;
+
+		if (verbose_level > 0)
+			fprintf(stderr, "[ackaccel] spoof OKAY #%llu (%u,%u) tokens=%d%s\n",
+				(unsigned long long)spoofed, out.arg0, out.arg1,
+				st.tokens, in.at_boundary() ? "" : " deferred");
+
+		if (in.at_boundary()) {
+			flush_pending(out_ti->peer_in);
+			enqueue_to(out_ti->peer_in, io);
+		} else {
+			pending.push_back(io);
+		}
+	}
+
+public:
+	// Called when endpoints are (re)activated: any previous session's
+	// bookkeeping (including queued spoofs holding stale ep numbers) is void.
+	void reset()
+	{
+		std::lock_guard<std::mutex> guard(mtx);
+		dead = false;
+		out.reset();
+		in.reset();
+		clear_streams();
+		spoofed = swallowed = 0;
+	}
+
+	// Feed a host->device bulk read (already committed to being forwarded).
+	void out_feed(struct thread_info *ti, const uint8_t *data, int len)
+	{
+		static const uint32_t WRTE = adb_cmd("WRTE");
+		static const uint32_t CNXN = adb_cmd("CNXN");
+		static const uint32_t CLSE = adb_cmd("CLSE");
+
+		std::lock_guard<std::mutex> guard(mtx);
+		if (dead || !ti->peer_in)
+			return;
+
+		int off = 0;
+		while (off < len) {
+			if (out.payload_remaining) {
+				uint32_t take = out.payload_remaining;
+				if ((int)take > len - off)
+					take = len - off;
+				out.payload_remaining -= take;
+				off += take;
+				continue;
+			}
+			out.hdr[out.hdr_have++] = data[off++];
+			if (out.hdr_have < 24)
+				continue;
+			out.hdr_have = 0;
+			uint32_t plen;
+			if (!parse_hdr(out.hdr, &out.cmd, &out.arg0, &out.arg1, &plen)) {
+				die("unparseable header on host->device stream");
+				return;
+			}
+			if (verbose_level > 0 && out.cmd != WRTE) {
+				char name[5];
+				cmd_to_string(out.cmd, name);
+				fprintf(stderr, "[ackaccel] host %s (%u,%u) len=%u\n",
+					name, out.arg0, out.arg1, plen);
+			}
+			if (out.cmd == CNXN) {
+				clear_streams();	/* new ADB session */
+			} else if (out.cmd == CLSE) {
+				pairs.erase(std::make_pair(out.arg0, out.arg1));
+			}
+			out.payload_remaining = plen;
+			// Ack on the WRTE *header*, not on payload completion: the
+			// host is committed to sending the payload and the gadget to
+			// accepting it, so the OKAY travels back while the payload is
+			// still streaming in and the host can queue the next WRTE
+			// with no gap. The at-risk window is bounded the same way
+			// (ACK_ACCEL_MAX_AHEAD spoofed-but-unconfirmed WRTEs).
+			if (out.cmd == WRTE)
+				on_wrte_complete(ti);
+		}
+	}
+
+	// Feed a device->host bulk read and take charge of enqueueing it
+	// (possibly swallowing it). Returns false if the accelerator is inactive
+	// and the caller should enqueue the read itself.
+	bool in_process(struct thread_info *ti, struct usb_raw_transfer_io &io,
+			int nbytes)
+	{
+		static const uint32_t OKAY = adb_cmd("OKAY");
+		static const uint32_t CNXN = adb_cmd("CNXN");
+		static const uint32_t CLSE = adb_cmd("CLSE");
+
+		std::lock_guard<std::mutex> guard(mtx);
+		if (dead)
+			return false;
+
+		// The only thing ever swallowed: a standalone 24-byte A_OKAY
+		// read whose stream pair has a decision at its FIFO head. adbd
+		// writes each transport header as its own USB transfer, so an
+		// OKAY always arrives as exactly one 24-byte read (the embedded
+		// case below fails open if that ever stops holding).
+		if (nbytes == 24 && in.at_boundary()) {
+			uint32_t cmd, arg0, arg1, plen;
+			if (parse_hdr((uint8_t *)io.data, &cmd, &arg0, &arg1, &plen) &&
+			    cmd == OKAY && plen == 0) {
+				auto key = std::make_pair(arg1, arg0);
+				auto it = pairs.find(key);
+				bool drop = false;
+				if (it != pairs.end()) {
+					// A pair we have spoofed on: the host already
+					// got its ack(s), so swallow. The real OKAY
+					// means the device drained this stream's
+					// buffer (it may cover any number of WRTEs),
+					// so refill the spoof credit and release any
+					// held ack.
+					drop = true;
+					swallowed++;
+					it->second.tokens = ACK_ACCEL_MAX_AHEAD;
+					if (!it->second.held.empty())
+						fprintf(stderr, "[ackaccel] release %zu held ack(s) (%u,%u)\n",
+							it->second.held.size(), arg0, arg1);
+					flush_pending(ti);
+					while (!it->second.held.empty()) {
+						it->second.tokens--;
+						spoofed++;
+						enqueue_to(ti, it->second.held.front());
+						it->second.held.pop_front();
+					}
+				} else {
+					// Never spoofed on this pair (e.g. the OPEN
+					// handshake OKAY): forward untouched.
+					if (verbose_level > 0)
+						fprintf(stderr, "[ackaccel] device OKAY (%u,%u) forwarded\n",
+							arg0, arg1);
+					enqueue_to(ti, io);
+				}
+				flush_pending(ti);
+				return true;
+			}
+		}
+
+		// Generic framing to track message boundaries on the IN stream.
+		uint8_t *data = (uint8_t *)io.data;
+		int off = 0;
+		while (off < nbytes) {
+			if (in.payload_remaining) {
+				uint32_t take = in.payload_remaining;
+				if ((int)take > nbytes - off)
+					take = nbytes - off;
+				in.payload_remaining -= take;
+				off += take;
+				continue;
+			}
+			in.hdr[in.hdr_have++] = data[off++];
+			if (in.hdr_have < 24)
+				continue;
+			in.hdr_have = 0;
+			uint32_t plen;
+			if (!parse_hdr(in.hdr, &in.cmd, &in.arg0, &in.arg1, &plen)) {
+				die("unparseable header on device->host stream");
+				enqueue_to(ti, io);
+				return true;
+			}
+			if (in.cmd == OKAY && !plen && !pairs.empty()) {
+				// An OKAY we may owe a swallow for arrived glued to
+				// other data; the standalone assumption broke, so stop
+				// meddling rather than desync the ack bookkeeping.
+				die("device OKAY not a standalone read");
+				enqueue_to(ti, io);
+				return true;
+			}
+			if (in.cmd == CNXN) {
+				clear_streams();
+			} else if (in.cmd == CLSE) {
+				pairs.erase(std::make_pair(in.arg1, in.arg0));
+			}
+			in.payload_remaining = plen;
+		}
+
+		enqueue_to(ti, io);
+		if (in.at_boundary())
+			flush_pending(ti);
+		return true;
+	}
+};
+
+static AdbAckAccel ack_accel;
 
 static uint16_t find_udc_maxpacket_for_interface(uint8_t interface_number)
 {
@@ -1214,10 +1568,19 @@ void *ep_loop_read(void *arg) {
 					if (injection_enabled)
 						injection(io, thread_info.device_bEndpointAddress, transfer_type);
 
-					data_mutex->lock();
-					data_queue->push_back(io);
-					data_mutex->unlock();
-					data_cv->notify_all();
+					// The accelerator owns the enqueue for bulk IN
+					// while active: it may swallow a device OKAY
+					// already acked locally, and only inserts
+					// fabricated OKAYs at message boundaries.
+					bool enqueued_by_accel = adb_ack_accel &&
+						(ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK &&
+						ack_accel.in_process(&thread_info, io, nbytes);
+					if (!enqueued_by_accel) {
+						data_mutex->lock();
+						data_queue->push_back(io);
+						data_mutex->unlock();
+						data_cv->notify_all();
+					}
 					if (verbose_level)
 						printf("EP%x(%s_%s): enqueued %d bytes to queue\n", ep.bEndpointAddress,
 								transfer_type.c_str(), dir.c_str(), nbytes);
@@ -1327,6 +1690,13 @@ void *ep_loop_read(void *arg) {
 			if (injection_enabled)
 				injection(io, thread_info.device_bEndpointAddress, transfer_type);
 
+			// From here the read is committed to being forwarded, so the
+			// accelerator may ack a WRTE this read completes.
+			if (adb_ack_accel &&
+			    (ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK &&
+			    rv > 0)
+				ack_accel.out_feed(&thread_info, (uint8_t *)io.data, rv);
+
 			// Fast path: with async bulk OUT enabled, submit to the device
 			// right here instead of handing off to the write thread.
 			// libusb_submit_transfer() doesn't block, so this thread returns
@@ -1376,6 +1746,12 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 
 	printf("Activating %d endpoints on interface %d\n", (int)alt->interface.bNumEndpoints, interface);
 
+	// Endpoint (re)activation voids any previous ADB session bookkeeping.
+	ack_accel.reset();
+
+	// Pass 1: set up all endpoint state and enable the endpoints. Threads are
+	// only created in pass 2, so cross-endpoint links (peer_in) are complete
+	// before any thread can dereference them.
 	for (int i = 0; i < alt->interface.bNumEndpoints; i++) {
 		struct raw_gadget_endpoint *ep = &alt->endpoints[i];
 
@@ -1389,6 +1765,7 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 		ep->thread_info.data_mutex = new std::mutex;
 		ep->thread_info.data_cv = new std::condition_variable;
 		ep->thread_info.please_stop = new std::atomic<bool>(false);
+		ep->thread_info.peer_in = NULL;
 
 		switch (usb_endpoint_type(&ep->endpoint)) {
 		case USB_ENDPOINT_XFER_ISOC:
@@ -1415,6 +1792,27 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 			ep->thread_info.transfer_type.c_str(),
 			ep->thread_info.dir.c_str(),
 			addr, ep->thread_info.ep_num);
+	}
+
+	// Link each bulk OUT endpoint to the altsetting's bulk IN endpoint (the
+	// ADB ACK accelerator queues fabricated OKAYs onto the IN queue).
+	struct thread_info *bulk_in_ti = NULL;
+	for (int i = 0; i < alt->interface.bNumEndpoints; i++) {
+		struct raw_gadget_endpoint *ep = &alt->endpoints[i];
+		if (usb_endpoint_type(&ep->endpoint) == USB_ENDPOINT_XFER_BULK &&
+		    usb_endpoint_dir_in(&ep->endpoint))
+			bulk_in_ti = &ep->thread_info;
+	}
+	for (int i = 0; i < alt->interface.bNumEndpoints; i++) {
+		struct raw_gadget_endpoint *ep = &alt->endpoints[i];
+		if (usb_endpoint_type(&ep->endpoint) == USB_ENDPOINT_XFER_BULK &&
+		    !usb_endpoint_dir_in(&ep->endpoint))
+			ep->thread_info.peer_in = bulk_in_ti;
+	}
+
+	// Pass 2: start the endpoint threads.
+	for (int i = 0; i < alt->interface.bNumEndpoints; i++) {
+		struct raw_gadget_endpoint *ep = &alt->endpoints[i];
 
 		if (verbose_level)
 			printf("Creating thread for EP%02x\n",
