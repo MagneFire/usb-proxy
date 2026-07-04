@@ -581,10 +581,12 @@ int receive_iso_data_batched(uint8_t endpoint, uint16_t maxPacketSize,
 }
 
 int receive_data(uint8_t endpoint, uint8_t attributes, uint16_t maxPacketSize,
-			uint8_t **dataptr, int *length, int timeout) {
+			uint8_t **dataptr, int *length, int timeout,
+			int read_len) {
 	int result = LIBUSB_SUCCESS;
 
 	int attempt = 0;
+	int want = maxPacketSize;
 	switch (attributes & USB_ENDPOINT_XFERTYPE_MASK) {
 	case USB_ENDPOINT_XFER_CONTROL:
 		fprintf(stderr, "Can't read on a control endpoint.\n");
@@ -594,9 +596,11 @@ int receive_data(uint8_t endpoint, uint8_t attributes, uint16_t maxPacketSize,
 		fprintf(stderr, "receive_data() should not be called for ISO endpoints.\n");
 		break;
 	case USB_ENDPOINT_XFER_BULK:
-		*dataptr = new uint8_t[maxPacketSize * 8];
+		if (read_len > 0)
+			want = read_len;
+		*dataptr = new uint8_t[want > maxPacketSize * 8 ? want : maxPacketSize * 8];
 		do {
-			result = libusb_bulk_transfer(dev_handle, endpoint, *dataptr, maxPacketSize, length, timeout);
+			result = libusb_bulk_transfer(dev_handle, endpoint, *dataptr, want, length, timeout);
 			if (result == LIBUSB_SUCCESS && verbose_level > 2)
 				printf("Received bulk data(%d) bytes\n", *length);
 			// A timeout on a bulk-IN poll is normal (the device simply had

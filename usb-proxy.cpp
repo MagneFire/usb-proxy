@@ -162,8 +162,9 @@ void usage() {
 		ISO_BATCH_SIZE_MAX, ISO_BATCH_SIZE_DEFAULT);
 	printf("\t--bulk_out_in_flight N: async bulk-OUT transfers kept in flight (0=synchronous, max %d, default %d)\n\n",
 		BULK_OUT_IN_FLIGHT_MAX, BULK_OUT_IN_FLIGHT_DEFAULT);
-	printf("\t--adb_ack_accel: acknowledge host ADB WRTEs locally (hides the proxy hop from\n");
-	printf("\t                 ADB flow control; the file-sync DONE handshake stays end-to-end)\n");
+	printf("\t--adb_ack_accel: acknowledge ADB WRTEs locally in both directions (hides the proxy\n");
+	printf("\t                 hop from ADB flow control on push AND pull; the file-sync\n");
+	printf("\t                 DONE handshake stays end-to-end)\n");
 	printf("\t--musb_out_read_packets N: bulk-OUT packets per gadget read on musb (default 1;\n");
 	printf("\t                           >1 needs a kernel with the musb requeue-flush fix)\n");
 	printf("* If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.\n");
