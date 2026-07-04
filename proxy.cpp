@@ -327,6 +327,18 @@ static AdbBulkDiag adb_bulk_diag_in_state;
 // Assumes a single proxied bulk IN/OUT pair speaks ADB (true for these
 // watches). A second bulk interface feeding non-ADB data would trip the
 // framing check and fail open — correct, just without the speedup.
+//
+// The same trick runs in the pull direction (device -> host WRTEs, i.e.
+// "adb pull"): on a device WRTE header a fabricated OKAY is submitted toward
+// the device (send_data_async, so it needs the async bulk-OUT path), and the
+// host's real OKAYs for that pair are swallowed on the OUT stream. Same
+// credit model, separate per-direction bookkeeping (pull_pairs). The
+// device-bound spoof may only be submitted while the host->device parser is
+// at a message boundary; since out_feed() runs before the OUT thread submits
+// the read it just parsed, the worst interleaving is two *complete* messages
+// swapping order, which ADB doesn't care about. Mid-message the spoof parks
+// in pending_out and the OUT read thread flushes it right after its own
+// submit (out_flush()).
 #define ACK_ACCEL_MAX_AHEAD 8
 
 class AdbAckAccel {
@@ -365,24 +377,46 @@ class AdbAckAccel {
 	std::deque<usb_raw_transfer_io> pending;
 	uint64_t spoofed = 0, swallowed = 0;
 
+	// Pull direction: device-bound spoofs are heap buffers handed to
+	// send_data_async (which takes ownership); these deques hold buffers we
+	// still own. Keyed (device id, host id) as seen on the device's WRTE.
+	struct PullPairState {
+		int tokens = ACK_ACCEL_MAX_AHEAD;
+		std::deque<uint8_t *> held;
+	};
+	std::map<std::pair<uint32_t, uint32_t>, PullPairState> pull_pairs;
+	// Device-bound spoofs waiting for the host->device stream to reach a
+	// message boundary.
+	std::deque<uint8_t *> pending_out;
+	uint64_t pull_spoofed = 0, pull_swallowed = 0;
+
 	// Lock order everywhere: mtx, then the endpoint queue's data_mutex.
 
 	void die(const char *why)
 	{
 		if (!dead)
 			fprintf(stderr, "[ackaccel] DISABLED for this session: %s "
-				"(forwarding verbatim; spoofed=%llu swallowed=%llu)\n",
+				"(forwarding verbatim; spoofed=%llu swallowed=%llu "
+				"pull_spoofed=%llu pull_swallowed=%llu)\n",
 				why, (unsigned long long)spoofed,
-				(unsigned long long)swallowed);
+				(unsigned long long)swallowed,
+				(unsigned long long)pull_spoofed,
+				(unsigned long long)pull_swallowed);
 		dead = true;
-		pairs.clear();
-		pending.clear();
+		clear_streams();
 	}
 
 	void clear_streams()
 	{
 		pairs.clear();
 		pending.clear();
+		for (auto &kv : pull_pairs)
+			for (uint8_t *buf : kv.second.held)
+				delete[] buf;
+		pull_pairs.clear();
+		for (uint8_t *buf : pending_out)
+			delete[] buf;
+		pending_out.clear();
 	}
 
 	static bool parse_hdr(const uint8_t *p, uint32_t *cmd, uint32_t *arg0,
@@ -462,6 +496,73 @@ class AdbAckAccel {
 		}
 	}
 
+	// Submit one device-bound fabricated OKAY. send_data_async() takes
+	// ownership of the buffer whatever happens; if the device is gone the
+	// IN read loop notices on its next receive and exits the process.
+	void submit_to_device(struct thread_info *out_ti, uint8_t *buf)
+	{
+		send_data_async(out_ti->device_bEndpointAddress, buf, 24,
+				USB_REQUEST_TIMEOUT);
+	}
+
+	// Caller holds mtx and has checked out.at_boundary().
+	void flush_pending_out_locked(struct thread_info *out_ti)
+	{
+		if (verbose_level > 0 && !pending_out.empty())
+			fprintf(stderr, "[ackaccel] flush %zu deferred device-bound spoof(s)\n",
+				pending_out.size());
+		while (!pending_out.empty()) {
+			submit_to_device(out_ti, pending_out.front());
+			pending_out.pop_front();
+		}
+	}
+
+	void on_device_wrte(struct thread_info *in_ti)
+	{
+		static const uint32_t OKAY = adb_cmd("OKAY");
+
+		// Needs the async submit path (ordering with the OUT read thread's
+		// own submissions relies on non-blocking, in-order
+		// libusb_submit_transfer calls) and a known device OUT endpoint.
+		if (bulk_out_max_in_flight <= 0 || !in_ti->peer_out)
+			return;
+
+		auto key = std::make_pair(in.arg0, in.arg1);
+		PullPairState &st = pull_pairs[key];
+
+		uint8_t *buf = new uint8_t[24];
+		put_le32(buf, OKAY);
+		put_le32(buf + 4, in.arg1);	/* host-side stream id */
+		put_le32(buf + 8, in.arg0);	/* device-side stream id */
+		put_le32(buf + 12, 0);
+		put_le32(buf + 16, 0);
+		put_le32(buf + 20, OKAY ^ 0xffffffffU);
+
+		if (st.tokens <= 0) {
+			// Same rationale as the push-side hold: the host hasn't
+			// signalled room since ACK_ACCEL_MAX_AHEAD spoofs, so let
+			// real flow control stall the device until its next OKAY.
+			fprintf(stderr, "[ackaccel] hold: pull (%u,%u) out of spoof credit, awaiting host OKAY\n",
+				in.arg0, in.arg1);
+			st.held.push_back(buf);
+			return;
+		}
+		st.tokens--;
+		pull_spoofed++;
+
+		if (verbose_level > 0)
+			fprintf(stderr, "[ackaccel] pull spoof OKAY #%llu (%u,%u) tokens=%d%s\n",
+				(unsigned long long)pull_spoofed, in.arg0, in.arg1,
+				st.tokens, out.at_boundary() ? "" : " deferred");
+
+		if (out.at_boundary()) {
+			flush_pending_out_locked(in_ti->peer_out);
+			submit_to_device(in_ti->peer_out, buf);
+		} else {
+			pending_out.push_back(buf);
+		}
+	}
+
 public:
 	// Called when endpoints are (re)activated: any previous session's
 	// bookkeeping (including queued spoofs holding stale ep numbers) is void.
@@ -473,18 +574,54 @@ public:
 		in.reset();
 		clear_streams();
 		spoofed = swallowed = 0;
+		pull_spoofed = pull_swallowed = 0;
 	}
 
 	// Feed a host->device bulk read (already committed to being forwarded).
-	void out_feed(struct thread_info *ti, const uint8_t *data, int len)
+	// Returns true if the accelerator consumed the read (a host OKAY
+	// swallowed for the pull direction) and the caller must NOT forward it.
+	bool out_feed(struct thread_info *ti, const uint8_t *data, int len)
 	{
 		static const uint32_t WRTE = adb_cmd("WRTE");
 		static const uint32_t CNXN = adb_cmd("CNXN");
 		static const uint32_t CLSE = adb_cmd("CLSE");
+		static const uint32_t OKAY = adb_cmd("OKAY");
 
 		std::lock_guard<std::mutex> guard(mtx);
 		if (dead || !ti->peer_in)
-			return;
+			return false;
+
+		// Pull-direction swallow: a standalone 24-byte host OKAY for a
+		// pair we spoof device-bound acks on. Mirrors the device-OKAY
+		// fast path in in_process(), including the standalone-transfer
+		// assumption (adb writes each transport header as its own USB
+		// transfer). The swallowed read never reaches the parser, which
+		// is consistent: it never reaches the device either.
+		if (len == 24 && out.at_boundary()) {
+			uint32_t cmd, arg0, arg1, plen;
+			if (parse_hdr(data, &cmd, &arg0, &arg1, &plen) &&
+			    cmd == OKAY && plen == 0) {
+				auto it = pull_pairs.find(std::make_pair(arg1, arg0));
+				if (it != pull_pairs.end()) {
+					pull_swallowed++;
+					it->second.tokens = ACK_ACCEL_MAX_AHEAD;
+					if (!it->second.held.empty())
+						fprintf(stderr, "[ackaccel] release %zu held device-bound ack(s) (%u,%u)\n",
+							it->second.held.size(), arg1, arg0);
+					flush_pending_out_locked(ti);
+					while (!it->second.held.empty()) {
+						it->second.tokens--;
+						pull_spoofed++;
+						submit_to_device(ti, it->second.held.front());
+						it->second.held.pop_front();
+					}
+					return true;
+				}
+				// An OKAY for a pair we never pull-spoofed on (e.g.
+				// the push direction's flow control): fall through to
+				// the parser and forward as before.
+			}
+		}
 
 		int off = 0;
 		while (off < len) {
@@ -503,7 +640,7 @@ public:
 			uint32_t plen;
 			if (!parse_hdr(out.hdr, &out.cmd, &out.arg0, &out.arg1, &plen)) {
 				die("unparseable header on host->device stream");
-				return;
+				return false;
 			}
 			if (verbose_level > 0 && out.cmd != WRTE) {
 				char name[5];
@@ -511,10 +648,23 @@ public:
 				fprintf(stderr, "[ackaccel] host %s (%u,%u) len=%u\n",
 					name, out.arg0, out.arg1, plen);
 			}
+			if (out.cmd == OKAY && !plen && !pull_pairs.empty()) {
+				// An OKAY we may owe a swallow for arrived glued to
+				// other host data; the standalone assumption broke, so
+				// stop meddling rather than desync the bookkeeping.
+				die("host OKAY not a standalone read");
+				return false;
+			}
 			if (out.cmd == CNXN) {
 				clear_streams();	/* new ADB session */
 			} else if (out.cmd == CLSE) {
 				pairs.erase(std::make_pair(out.arg0, out.arg1));
+				auto pit = pull_pairs.find(std::make_pair(out.arg1, out.arg0));
+				if (pit != pull_pairs.end()) {
+					for (uint8_t *buf : pit->second.held)
+						delete[] buf;
+					pull_pairs.erase(pit);
+				}
 			}
 			out.payload_remaining = plen;
 			// Ack on the WRTE *header*, not on payload completion: the
@@ -526,6 +676,45 @@ public:
 			if (out.cmd == WRTE)
 				on_wrte_complete(ti);
 		}
+		return false;
+	}
+
+	// Called by the OUT read thread right after it submitted a read to the
+	// device: if that read completed a host->device message, any parked
+	// device-bound spoofs may now go out (they land *after* the message
+	// they had to wait for).
+	void out_flush(struct thread_info *ti)
+	{
+		std::lock_guard<std::mutex> guard(mtx);
+		if (dead || pending_out.empty() || !out.at_boundary())
+			return;
+		flush_pending_out_locked(ti);
+	}
+
+	// How many bytes the next device->host bulk read should request.
+	// 0 = no opinion (caller uses its maxPacketSize default). Mid-payload
+	// the remaining length is known exactly from the WRTE header, so one
+	// read can take the whole payload instead of a blocking libusb call
+	// per 512-byte packet — this is what makes pull's datapath cheap.
+	// Only the IN read thread advances the `in` parser, so the value can't
+	// go stale between this call and the read itself.
+	int next_in_read_len()
+	{
+		std::lock_guard<std::mutex> guard(mtx);
+		if (dead || in.payload_remaining == 0)
+			return 0;
+		uint32_t want = in.payload_remaining;
+		if (want > MAX_TRANSFER_SIZE)
+			want = MAX_TRANSFER_SIZE;
+		return (int)want;
+	}
+
+	// Fail-open entry point for the read loops (e.g. a babble/overflow on
+	// a sized read means the framing assumption broke).
+	void fail(const char *why)
+	{
+		std::lock_guard<std::mutex> guard(mtx);
+		die(why);
 	}
 
 	// Feed a device->host bulk read and take charge of enqueueing it
@@ -537,6 +726,7 @@ public:
 		static const uint32_t OKAY = adb_cmd("OKAY");
 		static const uint32_t CNXN = adb_cmd("CNXN");
 		static const uint32_t CLSE = adb_cmd("CLSE");
+		static const uint32_t WRTE = adb_cmd("WRTE");
 
 		std::lock_guard<std::mutex> guard(mtx);
 		if (dead)
@@ -621,8 +811,20 @@ public:
 				clear_streams();
 			} else if (in.cmd == CLSE) {
 				pairs.erase(std::make_pair(in.arg1, in.arg0));
+				auto pit = pull_pairs.find(std::make_pair(in.arg0, in.arg1));
+				if (pit != pull_pairs.end()) {
+					for (uint8_t *buf : pit->second.held)
+						delete[] buf;
+					pull_pairs.erase(pit);
+				}
 			}
 			in.payload_remaining = plen;
+			// Pull mirror of the push-side ack-on-header: the device is
+			// committed to the payload, so ack it device-bound now and
+			// let the device queue its next WRTE without waiting for
+			// the host's OKAY round trip.
+			if (in.cmd == WRTE)
+				on_device_wrte(ti);
 		}
 
 		enqueue_to(ti, io);
@@ -1518,9 +1720,20 @@ void *ep_loop_read(void *arg) {
 				unsigned char *data = NULL;
 				int nbytes = -1;
 
+				// With the accelerator's stream parser mid-payload, the
+				// exact number of bytes the device is about to send is
+				// known from the WRTE header; take the whole remainder in
+				// one blocking call instead of one call per 512-byte
+				// packet (the dominant per-message cost on adb pull).
+				int read_len = 0;
+				if (adb_ack_accel &&
+				    (ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK)
+					read_len = ack_accel.next_in_read_len();
+
 				int rv = receive_data(thread_info.device_bEndpointAddress, ep.bmAttributes,
 							usb_endpoint_maxp(&ep),
-							&data, &nbytes, USB_REQUEST_TIMEOUT);
+							&data, &nbytes, USB_REQUEST_TIMEOUT,
+							read_len);
 				if (rv == LIBUSB_ERROR_NO_DEVICE) {
 					printf("EP%x(%s_%s): device gone, exiting usb-proxy\n",
 						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
@@ -1541,12 +1754,26 @@ void *ep_loop_read(void *arg) {
 					fprintf(stderr, "[in] EP%02x receive rv=%d nbytes=%d\n",
 						ep.bEndpointAddress, rv, nbytes);
 
-				// Only forward a read that actually succeeded. A timeout
-				// reports nbytes == 0 with no real data; forwarding it would
-				// inject a spurious zero-length packet to the host (which
-				// breaks the stream on musb). A genuine device ZLP arrives as
-				// LIBUSB_SUCCESS with nbytes == 0 and is still forwarded.
-				if (rv == LIBUSB_SUCCESS) {
+				// A babble on a sized read means the device sent more than
+				// the accelerator's parser expected — its framing view is
+				// wrong, so stop trusting it (reads fall back to one packet).
+				if (rv == LIBUSB_ERROR_OVERFLOW && read_len > 0) {
+					fprintf(stderr, "EP%x(%s_%s): overflow on %d-byte sized read, %d bytes\n",
+						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str(),
+						read_len, nbytes);
+					ack_accel.fail("bulk IN overflow on sized read");
+				}
+
+				// Only forward a read that actually succeeded. An empty
+				// timeout reports nbytes == 0 with no real data; forwarding
+				// it would inject a spurious zero-length packet to the host
+				// (which breaks the stream on musb). A genuine device ZLP
+				// arrives as LIBUSB_SUCCESS with nbytes == 0 and is still
+				// forwarded. A sized (multi-packet) read CAN time out with
+				// partial data, though — those bytes are real and must be
+				// forwarded, not dropped.
+				if (rv == LIBUSB_SUCCESS ||
+				    (rv == LIBUSB_ERROR_TIMEOUT && nbytes > 0)) {
 					// Mirror the OUT-side diagnostic on the IN stream so the
 					// log shows both halves of the ADB conversation (host
 					// WRTE/DATA vs device OKAY) — distinguishes "device never
@@ -1691,11 +1918,19 @@ void *ep_loop_read(void *arg) {
 				injection(io, thread_info.device_bEndpointAddress, transfer_type);
 
 			// From here the read is committed to being forwarded, so the
-			// accelerator may ack a WRTE this read completes.
+			// accelerator may ack a WRTE this read completes. It may also
+			// consume the read outright (a host OKAY already delivered to
+			// the device as a fabricated ack) — then nothing is forwarded.
 			if (adb_ack_accel &&
 			    (ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK &&
-			    rv > 0)
-				ack_accel.out_feed(&thread_info, (uint8_t *)io.data, rv);
+			    rv > 0) {
+				if (ack_accel.out_feed(&thread_info, (uint8_t *)io.data, rv)) {
+					if (verbose_level > 0)
+						printf("EP%x(%s_%s): host OKAY swallowed by ack accel\n",
+							ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
+					continue;
+				}
+			}
 
 			// Fast path: with async bulk OUT enabled, submit to the device
 			// right here instead of handing off to the write thread.
@@ -1722,6 +1957,10 @@ void *ep_loop_read(void *arg) {
 					fflush(stdout);
 					_exit(0);
 				}
+				// If this read completed a host->device message, parked
+				// device-bound spoofs may now follow it out.
+				if (adb_ack_accel)
+					ack_accel.out_flush(&thread_info);
 				continue;
 			}
 
@@ -1766,6 +2005,7 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 		ep->thread_info.data_cv = new std::condition_variable;
 		ep->thread_info.please_stop = new std::atomic<bool>(false);
 		ep->thread_info.peer_in = NULL;
+		ep->thread_info.peer_out = NULL;
 
 		switch (usb_endpoint_type(&ep->endpoint)) {
 		case USB_ENDPOINT_XFER_ISOC:
@@ -1794,19 +2034,28 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 			addr, ep->thread_info.ep_num);
 	}
 
-	// Link each bulk OUT endpoint to the altsetting's bulk IN endpoint (the
-	// ADB ACK accelerator queues fabricated OKAYs onto the IN queue).
+	// Link the altsetting's bulk OUT and bulk IN endpoints to each other:
+	// the ADB ACK accelerator queues fabricated OKAYs onto the IN queue
+	// (push direction) and submits fabricated OKAYs on the OUT endpoint's
+	// device address (pull direction).
 	struct thread_info *bulk_in_ti = NULL;
+	struct thread_info *bulk_out_ti = NULL;
 	for (int i = 0; i < alt->interface.bNumEndpoints; i++) {
 		struct raw_gadget_endpoint *ep = &alt->endpoints[i];
-		if (usb_endpoint_type(&ep->endpoint) == USB_ENDPOINT_XFER_BULK &&
-		    usb_endpoint_dir_in(&ep->endpoint))
+		if (usb_endpoint_type(&ep->endpoint) != USB_ENDPOINT_XFER_BULK)
+			continue;
+		if (usb_endpoint_dir_in(&ep->endpoint))
 			bulk_in_ti = &ep->thread_info;
+		else
+			bulk_out_ti = &ep->thread_info;
 	}
 	for (int i = 0; i < alt->interface.bNumEndpoints; i++) {
 		struct raw_gadget_endpoint *ep = &alt->endpoints[i];
-		if (usb_endpoint_type(&ep->endpoint) == USB_ENDPOINT_XFER_BULK &&
-		    !usb_endpoint_dir_in(&ep->endpoint))
+		if (usb_endpoint_type(&ep->endpoint) != USB_ENDPOINT_XFER_BULK)
+			continue;
+		if (usb_endpoint_dir_in(&ep->endpoint))
+			ep->thread_info.peer_out = bulk_out_ti;
+		else
 			ep->thread_info.peer_in = bulk_in_ti;
 	}
 

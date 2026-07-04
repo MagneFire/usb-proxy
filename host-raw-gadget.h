@@ -122,6 +122,10 @@ struct thread_info {
 	// thread_info on the same altsetting, so the ADB ACK accelerator can
 	// queue fabricated OKAYs toward the host. NULL otherwise.
 	struct thread_info		*peer_in;
+	// For a bulk IN endpoint: the paired bulk OUT endpoint's thread_info,
+	// so the accelerator can submit fabricated OKAYs toward the device
+	// (accelerating adb pull the way peer_in accelerates push). NULL otherwise.
+	struct thread_info		*peer_out;
 };
 
 struct raw_gadget_endpoint {

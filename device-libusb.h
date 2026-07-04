@@ -57,7 +57,12 @@ int send_data(uint8_t endpoint, uint8_t attributes, uint8_t *dataptr,
 // thread), or a libusb error (notably LIBUSB_ERROR_NO_DEVICE).
 int send_data_async(uint8_t endpoint, uint8_t *dataptr, int length, int timeout);
 int send_iso_data(uint8_t endpoint, uint8_t *dataptr, int length, int timeout);
+// read_len: requested bulk read size; 0 means the default (one
+// maxPacketSize packet). Callers that know how many bytes the device is
+// about to send (the ADB ACK accelerator's stream parser does) can take a
+// whole message payload in one blocking call instead of one per packet.
 int receive_data(uint8_t endpoint, uint8_t attributes, uint16_t maxPacketSize,
-			uint8_t **dataptr, int *length, int timeout);
+			uint8_t **dataptr, int *length, int timeout,
+			int read_len = 0);
 int receive_iso_data_batched(uint8_t endpoint, uint16_t maxPacketSize,
 			struct iso_batch_result *result, int batch_size, int timeout);
