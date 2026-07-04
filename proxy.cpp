@@ -928,6 +928,7 @@ void *ep_loop_write(void *arg) {
 	std::string dir = thread_info.dir;
 	std::deque<usb_raw_transfer_io> *data_queue = thread_info.data_queue;
 	std::mutex *data_mutex = thread_info.data_mutex;
+	std::condition_variable *data_cv = thread_info.data_cv;
 	std::atomic<bool> *please_stop = thread_info.please_stop;
 
 	printf("Start writing thread for EP%02x, thread id(%d)\n",
@@ -941,15 +942,17 @@ void *ep_loop_write(void *arg) {
 	while (!*please_stop && !please_stop_eps) {
 		assert(ep_num != -1);
 
-		data_mutex->lock();
+		std::unique_lock<std::mutex> lock(*data_mutex);
 		if (data_queue->empty()) {
-			data_mutex->unlock();
-			usleep(100);
-			continue;
+			data_cv->wait_for(lock, std::chrono::milliseconds(1));
+			if (data_queue->empty())
+				continue;
 		}
 		struct usb_raw_transfer_io io = data_queue->front();
 		data_queue->pop_front();
-		data_mutex->unlock();
+		lock.unlock();
+		// Wake a reader parked on the queue-full backoff.
+		data_cv->notify_all();
 
 		if (verbose_level >= 2)
 			printData(io, ep.bEndpointAddress, transfer_type, dir);
@@ -1070,6 +1073,7 @@ void *ep_loop_read(void *arg) {
 	std::string dir = thread_info.dir;
 	std::deque<usb_raw_transfer_io> *data_queue = thread_info.data_queue;
 	std::mutex *data_mutex = thread_info.data_mutex;
+	std::condition_variable *data_cv = thread_info.data_cv;
 	std::atomic<bool> *please_stop = thread_info.please_stop;
 
 	printf("Start reading thread for EP%02x, thread id(%d)\n",
@@ -1085,12 +1089,15 @@ void *ep_loop_read(void *arg) {
 		struct usb_raw_transfer_io io;
 
 		if (ep.bEndpointAddress & USB_DIR_IN) {
-			data_mutex->lock();
-			bool queue_full = data_queue->size() >= 32;
-			data_mutex->unlock();
-			if (queue_full) {
-				usleep(200);
-				continue;
+			{
+				std::unique_lock<std::mutex> lock(*data_mutex);
+				if (data_queue->size() >= 32) {
+					// Wait for the writer to drain (it notifies
+					// after every pop); bounded so please_stop
+					// stays responsive.
+					data_cv->wait_for(lock, std::chrono::milliseconds(1));
+					continue;
+				}
 			}
 
 			if ((ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_ISOC) {
@@ -1141,6 +1148,7 @@ void *ep_loop_read(void *arg) {
 					data_mutex->lock();
 					data_queue->push_back(io);
 					data_mutex->unlock();
+					data_cv->notify_all();
 					packets_enqueued++;
 				}
 				if (verbose_level)
@@ -1209,6 +1217,7 @@ void *ep_loop_read(void *arg) {
 					data_mutex->lock();
 					data_queue->push_back(io);
 					data_mutex->unlock();
+					data_cv->notify_all();
 					if (verbose_level)
 						printf("EP%x(%s_%s): enqueued %d bytes to queue\n", ep.bEndpointAddress,
 								transfer_type.c_str(), dir.c_str(), nbytes);
@@ -1226,12 +1235,12 @@ void *ep_loop_read(void *arg) {
 			// cap above. With async bulk OUT the writer keeps the device bus
 			// busy, so in a healthy transfer this stays near-empty and never
 			// actually throttles the host.
-			data_mutex->lock();
-			bool queue_full = data_queue->size() >= 64;
-			data_mutex->unlock();
-			if (queue_full) {
-				usleep(50);
-				continue;
+			{
+				std::unique_lock<std::mutex> lock(*data_mutex);
+				if (data_queue->size() >= 64) {
+					data_cv->wait_for(lock, std::chrono::milliseconds(1));
+					continue;
+				}
 			}
 
 			io.inner.ep = ep_num;
@@ -1318,9 +1327,38 @@ void *ep_loop_read(void *arg) {
 			if (injection_enabled)
 				injection(io, thread_info.device_bEndpointAddress, transfer_type);
 
+			// Fast path: with async bulk OUT enabled, submit to the device
+			// right here instead of handing off to the write thread.
+			// libusb_submit_transfer() doesn't block, so this thread returns
+			// to usb_raw_ep_read() immediately, and one queue handoff
+			// (~100us that sat on the ADB WRTE->OKAY round trip) disappears.
+			// All submissions for this endpoint happen on this one thread, so
+			// delivery order is preserved; the write thread simply never sees
+			// bulk-OUT traffic while the async path is active.
+			if ((ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK &&
+			    bulk_out_max_in_flight > 0) {
+				int length = io.inner.length;
+				unsigned char *data = new unsigned char[length];
+				memcpy(data, io.data, length);
+
+				int arv = send_data_async(thread_info.device_bEndpointAddress,
+							  data, length, USB_REQUEST_TIMEOUT);
+				if (arv == LIBUSB_ERROR_NO_DEVICE) {
+					printf("EP%x(%s_%s): device gone, exiting usb-proxy\n",
+						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
+					/* Same rationale as the write-thread path: no udev, so
+					 * hotplug doesn't fire; terminate and let the service
+					 * manager respawn us on replug. */
+					fflush(stdout);
+					_exit(0);
+				}
+				continue;
+			}
+
 			data_mutex->lock();
 			data_queue->push_back(io);
 			data_mutex->unlock();
+			data_cv->notify_all();
 			if (verbose_level)
 				printf("EP%x(%s_%s): enqueued %d bytes to queue\n", ep.bEndpointAddress,
 						transfer_type.c_str(), dir.c_str(), rv);
@@ -1349,6 +1387,7 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 		ep->thread_info.device_bEndpointAddress = ep->device_bEndpointAddress;
 		ep->thread_info.data_queue = new std::deque<usb_raw_transfer_io>;
 		ep->thread_info.data_mutex = new std::mutex;
+		ep->thread_info.data_cv = new std::condition_variable;
 		ep->thread_info.please_stop = new std::atomic<bool>(false);
 
 		switch (usb_endpoint_type(&ep->endpoint)) {
@@ -1428,9 +1467,11 @@ void terminate_eps(int fd, int config, int interface, int altsetting) {
 
 		delete ep->thread_info.data_queue;
 		delete ep->thread_info.data_mutex;
+		delete ep->thread_info.data_cv;
 		delete ep->thread_info.please_stop;
 		ep->thread_info.data_queue = nullptr;
 		ep->thread_info.data_mutex = nullptr;
+		ep->thread_info.data_cv = nullptr;
 		ep->thread_info.please_stop = nullptr;
 	}
 }
