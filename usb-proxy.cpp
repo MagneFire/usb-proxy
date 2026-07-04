@@ -25,6 +25,10 @@ bool bmaxpacketsize0_must_greater_than_64 = true;
 bool auto_remap_endpoints = false;
 int iso_batch_size = ISO_BATCH_SIZE_DEFAULT;
 int bulk_out_max_in_flight = BULK_OUT_IN_FLIGHT_DEFAULT;
+// ADB ACK accelerator: locally acknowledge host WRTEs and swallow the device's
+// real OKAYs, hiding the proxy's store-and-forward hop from ADB's one-WRTE-
+// in-flight flow control. Opt-in; see the AdbAckAccel comment in proxy.cpp.
+bool adb_ack_accel = false;
 // Bulk-OUT gadget reads on musb: packets per read buffer (maxp * N, capped to
 // MAX_TRANSFER_SIZE). Default 1 = the historical one-packet clamp, required on
 // kernels without the musb requeue-flush fix. With a fixed kernel, 8 cuts the
@@ -52,6 +56,15 @@ static void cfg_int(const Json::Value &cfg, const char *key, int &dst, int lo, i
 {
 	if (cfg.isMember(key))
 		set_int_knob(key, dst, cfg[key].asInt(), lo, hi);
+}
+
+static void cfg_bool(const Json::Value &cfg, const char *key, bool &dst)
+{
+	bool v = cfg.get(key, dst).asBool();
+	if (v != dst) {
+		dst = v;
+		printf("%s set to %s\n", key, v ? "true" : "false");
+	}
 }
 
 // Print the transform summary for a single injection rule.
@@ -149,6 +162,8 @@ void usage() {
 		ISO_BATCH_SIZE_MAX, ISO_BATCH_SIZE_DEFAULT);
 	printf("\t--bulk_out_in_flight N: async bulk-OUT transfers kept in flight (0=synchronous, max %d, default %d)\n\n",
 		BULK_OUT_IN_FLIGHT_MAX, BULK_OUT_IN_FLIGHT_DEFAULT);
+	printf("\t--adb_ack_accel: acknowledge host ADB WRTEs locally (hides the proxy hop from\n");
+	printf("\t                 ADB flow control; the file-sync DONE handshake stays end-to-end)\n");
 	printf("\t--musb_out_read_packets N: bulk-OUT packets per gadget read on musb (default 1;\n");
 	printf("\t                           >1 needs a kernel with the musb requeue-flush fix)\n");
 	printf("* If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.\n");
@@ -512,6 +527,7 @@ int main(int argc, char **argv)
 		{"iso_batch_size", required_argument, &lopt, 11},
 		{"bulk_out_in_flight", required_argument, &lopt, 12},
 		{"musb_out_read_packets", required_argument, &lopt, 13},
+		{"adb_ack_accel", no_argument, &lopt, 14},
 		{0, 0, 0, 0}
 	};
 	while ((opt = getopt_long(argc, argv, optstring, long_options, &loidx)) != -1) {
@@ -571,6 +587,10 @@ int main(int argc, char **argv)
 		case 13:
 			set_int_knob("musb_out_read_packets", musb_out_read_packets,
 				     std::stoi(optarg), 1, MUSB_OUT_READ_PACKETS_MAX);
+			break;
+		case 14:
+			adb_ack_accel = true;
+			printf("adb_ack_accel set to true\n");
 			break;
 
 		default:
@@ -640,6 +660,7 @@ int main(int argc, char **argv)
 			bulk_out_max_in_flight, 0, BULK_OUT_IN_FLIGHT_MAX);
 		cfg_int(customized_config, "musb_out_read_packets",
 			musb_out_read_packets, 1, MUSB_OUT_READ_PACKETS_MAX);
+		cfg_bool(customized_config, "adb_ack_accel", adb_ack_accel);
 	}
 
 	while (connect_device(vendor_id, product_id)) {

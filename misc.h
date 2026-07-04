@@ -27,6 +27,7 @@ extern bool reset_device_before_proxy;
 extern bool bmaxpacketsize0_must_greater_than_64;
 extern int iso_batch_size;
 extern int bulk_out_max_in_flight;
+extern bool adb_ack_accel;
 // Bulk-OUT packets per gadget read on musb (1 = the one-packet clamp).
 extern int musb_out_read_packets;
 #define MUSB_OUT_READ_PACKETS_MAX 64
