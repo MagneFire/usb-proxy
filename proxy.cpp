@@ -1475,6 +1475,96 @@ void printData(struct usb_raw_transfer_io io, __u8 bEndpointAddress, std::string
 
 void noop_signal_handler(int) { }
 
+// A proxied device can vanish mid-transfer with its final device->host
+// response still sitting in a bulk/interrupt IN queue, not yet written to the
+// host. The classic case is `fastboot boot`: the bootloader answers OKAY and
+// immediately jumps into the kernel, dropping off the bus a fraction of a
+// millisecond later. The moment a device-side libusb call then returns
+// NO_DEVICE we do want to terminate (see the per-site comments: without udev
+// hotplug never fires, so the service manager respawns us on replug) — but
+// exiting the instant we notice closes /dev/raw-gadget and takes the gadget
+// down with that OKAY still queued. The host's pending status read then fails:
+// fastboot reports "Status read failed (Operation timed out)".
+//
+// So give the IN write threads a brief, bounded window to flush what they
+// already hold before we _exit(). Only non-ISO IN queues are drained: ISO
+// carries realtime data that is meaningless once the device is gone, and its
+// own IN write thread can be the caller here (it must not wait on itself).
+// Every thread that reaches this on a NO_DEVICE is a device-side reader or an
+// OUT/ISO writer — never a bulk/interrupt IN *write* thread (those only touch
+// the gadget, which returns ESHUTDOWN, not NO_DEVICE) — so the threads doing
+// the draining are never the ones blocked here, and there is no self-deadlock.
+// First caller wins; concurrent callers block in call_once() until it _exit()s.
+static void drain_in_queues_and_exit(void)
+{
+	static std::once_flag once;
+	std::call_once(once, [] {
+		int cfg_idx = host_device_desc.current_config;
+		if (cfg_idx < 0) {
+			fflush(stdout);
+			_exit(0);
+		}
+		struct raw_gadget_config *config = &host_device_desc.configs[cfg_idx];
+
+		auto in_queues_empty = [&]() {
+			for (int i = 0; i < config->config.bNumInterfaces; i++) {
+				struct raw_gadget_interface *iface = &config->interfaces[i];
+				struct raw_gadget_altsetting *alt =
+					&iface->altsettings[iface->current_altsetting];
+				for (int k = 0; k < alt->interface.bNumEndpoints; k++) {
+					struct raw_gadget_endpoint *ep = &alt->endpoints[k];
+					if (!usb_endpoint_dir_in(&ep->endpoint))
+						continue;
+					if (usb_endpoint_type(&ep->endpoint) == USB_ENDPOINT_XFER_ISOC)
+						continue;
+					std::mutex *m = ep->thread_info.data_mutex;
+					std::deque<usb_raw_transfer_io> *q = ep->thread_info.data_queue;
+					if (!m || !q)
+						continue;
+					std::lock_guard<std::mutex> guard(*m);
+					if (!q->empty())
+						return false;
+				}
+			}
+			return true;
+		};
+
+		// Wait for the queues to empty, then confirm they stay empty across a
+		// short settle. Two reasons a single "empty" glimpse is not enough:
+		// an OKAY that an IN read thread pulled a hair before the disconnect
+		// was noticed elsewhere may still be a few microseconds from being
+		// enqueued; and "empty" only means the writer has *popped* the last
+		// transfer, so the settle doubles as time for its in-flight
+		// usb_raw_ep_write() to actually reach the host.
+		const auto deadline = std::chrono::steady_clock::now() +
+				      std::chrono::milliseconds(300);
+		bool drained = false;
+		while (std::chrono::steady_clock::now() < deadline) {
+			if (in_queues_empty()) {
+				usleep(30000);
+				if (in_queues_empty()) {
+					drained = true;
+					break;
+				}
+				continue;
+			}
+			usleep(2000);
+		}
+
+		if (verbose_level > 0)
+			fprintf(stderr, "[drain] device gone; IN queues %s, exiting\n",
+				drained ? "flushed" : "flush timed out");
+		fflush(stdout);
+		_exit(0);
+	});
+
+	// Unreachable in practice: the winning thread above _exit()s and every
+	// other caller blocks inside call_once() until it does. Guard anyway so a
+	// spurious return can never fall back into a read/write loop.
+	for (;;)
+		pause();
+}
+
 void *ep_loop_write(void *arg) {
 	struct thread_info thread_info = *((struct thread_info*) arg);
 	int fd = thread_info.fd;
@@ -1558,8 +1648,7 @@ void *ep_loop_write(void *arg) {
 					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
 					 * the UDC) and the service manager respawns us to re-proxy
 					 * on replug. */
-					fflush(stdout);
-					_exit(0);
+					drain_in_queues_and_exit();
 					break;
 				}
 				if (rv != LIBUSB_SUCCESS)
@@ -1582,8 +1671,7 @@ void *ep_loop_write(void *arg) {
 					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
 					 * the UDC) and the service manager respawns us to re-proxy
 					 * on replug. */
-					fflush(stdout);
-					_exit(0);
+					drain_in_queues_and_exit();
 					break;
 				}
 			} else {
@@ -1599,8 +1687,7 @@ void *ep_loop_write(void *arg) {
 					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
 					 * the UDC) and the service manager respawns us to re-proxy
 					 * on replug. */
-					fflush(stdout);
-					_exit(0);
+					drain_in_queues_and_exit();
 					break;
 				}
 				// send_data() only returns non-SUCCESS for fatal errors now
@@ -1670,8 +1757,7 @@ void *ep_loop_read(void *arg) {
 					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
 					 * the UDC) and the service manager respawns us to re-proxy
 					 * on replug. */
-					fflush(stdout);
-					_exit(0);
+					drain_in_queues_and_exit();
 					break;
 				}
 
@@ -1743,8 +1829,7 @@ void *ep_loop_read(void *arg) {
 					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
 					 * the UDC) and the service manager respawns us to re-proxy
 					 * on replug. */
-					fflush(stdout);
-					_exit(0);
+					drain_in_queues_and_exit();
 					if (data)
 						delete[] data;
 					break;
@@ -1954,8 +2039,7 @@ void *ep_loop_read(void *arg) {
 					/* Same rationale as the write-thread path: no udev, so
 					 * hotplug doesn't fire; terminate and let the service
 					 * manager respawn us on replug. */
-					fflush(stdout);
-					_exit(0);
+					drain_in_queues_and_exit();
 				}
 				// If this read completed a host->device message, parked
 				// device-bound spoofs may now follow it out.
