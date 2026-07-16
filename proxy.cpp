@@ -1707,6 +1707,28 @@ void *ep_loop_write(void *arg) {
 	return NULL;
 }
 
+// A fastboot host download command is exactly "download:%08x" (17 bytes, sent
+// as its own bulk OUT transfer). Returns the payload length that follows, or
+// -1 if the buffer isn't a download command.
+static int64_t fastboot_download_len(const uint8_t *data, int len)
+{
+	if (len != 17 || memcmp(data, "download:", 9) != 0)
+		return -1;
+	uint64_t v = 0;
+	for (int i = 9; i < 17; i++) {
+		uint8_t c = data[i];
+		if (c >= '0' && c <= '9')
+			v = v * 16 + (c - '0');
+		else if (c >= 'a' && c <= 'f')
+			v = v * 16 + (c - 'a' + 10);
+		else if (c >= 'A' && c <= 'F')
+			v = v * 16 + (c - 'A' + 10);
+		else
+			return -1;
+	}
+	return (int64_t)v;
+}
+
 void *ep_loop_read(void *arg) {
 	struct thread_info thread_info = *((struct thread_info*) arg);
 	int fd = thread_info.fd;
@@ -1725,6 +1747,13 @@ void *ep_loop_read(void *arg) {
 	// Set a no-op handler for SIGUSR1. Sending this signal to the thread
 	// will thus interrupt a blocking ioctl call without other side-effects.
 	signal(SIGUSR1, noop_signal_handler);
+
+	// Remaining payload bytes of an in-progress fastboot "download:%08x" on
+	// this (bulk OUT) endpoint; used to size the final gadget reads (see the
+	// read-sizing comment below). Thread-local by construction: only this
+	// thread reads this endpoint, and endpoint threads are torn down and
+	// restarted on reset/re-enumeration, which clears the state.
+	uint64_t fastboot_dl_remaining = 0;
 
 	// Check both per-endpoint flag (interface change) and global flag (device reset)
 	while (!*please_stop && !please_stop_eps) {
@@ -1950,6 +1979,26 @@ void *ep_loop_read(void *arg) {
 				io.inner.length = sizeof(io.data);
 			}
 
+			// Fastboot download tail sizing: the download payload is a raw
+			// bulk stream with no terminating ZLP, so when its length is a
+			// multiple of wMaxPacketSize the final packets can't complete a
+			// multi-packet read via a short packet. If that tail is smaller
+			// than the read buffer, usb_raw_ep_read() blocks forever and the
+			// download hangs a few KB short of done (seen on musb with
+			// multi-packet reads: an 8,026,112-byte image = 1959 full
+			// 4096-byte reads + 2048 bytes stuck, host pinned at
+			// 'downloading'). The host announces the exact payload length in
+			// the "download:%08x" command, so shrink reads to the remaining
+			// payload (rounded up to a whole packet) and the last buffer
+			// completes on fill instead.
+			if ((ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK &&
+			    fastboot_dl_remaining > 0) {
+				unsigned int maxp = usb_endpoint_maxp(&ep);
+				uint64_t want = (fastboot_dl_remaining + maxp - 1) / maxp * maxp;
+				if (want < io.inner.length)
+					io.inner.length = (unsigned int)want;
+			}
+
 			int rv = usb_raw_ep_read(fd, (struct usb_raw_ep_io *)&io);
 			if (rv < 0 && errno == ESHUTDOWN) {
 				printf("EP%x(%s_%s): device likely reset, stopping thread\n",
@@ -1974,6 +2023,32 @@ void *ep_loop_read(void *arg) {
 			printf("EP%x(%s_%s): read %d bytes from host\n", ep.bEndpointAddress,
 					transfer_type.c_str(), dir.c_str(), rv);
 			io.inner.length = rv;
+
+			// Advance/arm the fastboot download tracker (see the sizing
+			// logic above). A 17-byte "download:%08x" read arms it; payload
+			// reads drain it. False positives are near-impossible (an exact
+			// 17-byte bulk transfer with that content) and harmless anyway:
+			// the tracker only ever shrinks read buffers, never blocks.
+			if ((ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK &&
+			    rv > 0) {
+				if (fastboot_dl_remaining > 0) {
+					uint64_t got = (uint64_t)rv;
+					if (got > fastboot_dl_remaining)
+						got = fastboot_dl_remaining;
+					fastboot_dl_remaining -= got;
+					if (fastboot_dl_remaining == 0)
+						printf("EP%x(%s_%s): fastboot download payload complete\n",
+							ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
+				} else {
+					int64_t dl = fastboot_download_len((const uint8_t *)io.data, rv);
+					if (dl > 0) {
+						fastboot_dl_remaining = (uint64_t)dl;
+						printf("EP%x(%s_%s): fastboot download of %lld bytes, sizing tail reads\n",
+							ep.bEndpointAddress, transfer_type.c_str(),
+							dir.c_str(), (long long)dl);
+					}
+				}
+			}
 
 			if (adb_bulk_diag &&
 			    (ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK &&
