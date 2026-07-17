@@ -189,7 +189,26 @@ void reset_device() {
 }
 
 void set_configuration(int configuration) {
-	int result = libusb_set_configuration(dev_handle, configuration);
+	// The proxy host's kernel already configured the device at enumeration,
+	// so the host's SET_CONFIGURATION usually asks for the configuration the
+	// device is already in. Forwarding that duplicate is not harmless: the
+	// legacy Android gadget (e.g. TWRP-era recovery) reacts to a repeat
+	// SET_CONFIGURATION by tearing down and re-initialising every function,
+	// which kills adbd's endpoints and pulse-disconnects the device off the
+	// bus — with the host then re-enumerating, this loops forever. Skipping
+	// also keeps both sides' data-toggle state untouched and consistent,
+	// whereas forwarding resets only the device's side. On Linux the active
+	// configuration is answered from sysfs, so this check puts nothing on
+	// the bus.
+	int active = -1;
+	int result = libusb_get_configuration(dev_handle, &active);
+	if (result == LIBUSB_SUCCESS && active == configuration) {
+		printf("Device already in configuration %d, not re-sending SET_CONFIGURATION\n",
+				configuration);
+		return;
+	}
+
+	result = libusb_set_configuration(dev_handle, configuration);
 	if (result != LIBUSB_SUCCESS) {
 		fprintf(stderr, "Error setting configuration(%d): %s\n",
 				configuration, libusb_strerror((libusb_error)result));
