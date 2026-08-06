@@ -1,4 +1,5 @@
 #include <atomic>
+#include <climits>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -9,6 +10,7 @@
 #include "device-libusb.h"
 #include "proxy.h"
 #include "misc.h"
+#include "power-policy.h"
 
 int verbose_level = 0;
 bool please_stop_ep0 = false;
@@ -167,6 +169,11 @@ void usage() {
 	printf("\t                 DONE handshake stays end-to-end)\n");
 	printf("\t--musb_out_read_packets N: bulk-OUT packets per gadget read on musb (default 1;\n");
 	printf("\t                           >1 needs a kernel with the musb requeue-flush fix)\n");
+	printf("\t--power_hook PATH: run `PATH active` on the first traffic after an idle period\n");
+	printf("\t                   and `PATH idle` once traffic stops, so the board can wind\n");
+	printf("\t                   its CPU down while nothing is happening (default: disabled)\n");
+	printf("\t--power_idle_ms N: quiet period before `power_hook idle` runs (default %d)\n",
+		power_idle_ms);
 	printf("* If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.\n");
 	printf("* If `driver` not specified, `usb-proxy` will use `dummy_udc` as default driver.\n");
 	printf("* If both `vendor_id` and `product_id` not specified, `usb-proxy` will connect\n");
@@ -529,6 +536,8 @@ int main(int argc, char **argv)
 		{"bulk_out_in_flight", required_argument, &lopt, 12},
 		{"musb_out_read_packets", required_argument, &lopt, 13},
 		{"adb_ack_accel", no_argument, &lopt, 14},
+		{"power_hook", required_argument, &lopt, 15},
+		{"power_idle_ms", required_argument, &lopt, 16},
 		{0, 0, 0, 0}
 	};
 	while ((opt = getopt_long(argc, argv, optstring, long_options, &loidx)) != -1) {
@@ -592,6 +601,13 @@ int main(int argc, char **argv)
 		case 14:
 			adb_ack_accel = true;
 			printf("adb_ack_accel set to true\n");
+			break;
+		case 15:
+			power_hook = optarg;
+			break;
+		case 16:
+			set_int_knob("power_idle_ms", power_idle_ms, std::stoi(optarg),
+				     POWER_IDLE_MS_MIN, INT_MAX);
 			break;
 
 		default:
@@ -662,7 +678,14 @@ int main(int argc, char **argv)
 		cfg_int(customized_config, "musb_out_read_packets",
 			musb_out_read_packets, 1, MUSB_OUT_READ_PACKETS_MAX);
 		cfg_bool(customized_config, "adb_ack_accel", adb_ack_accel);
+		if (customized_config.isMember("power_hook"))
+			power_hook = customized_config["power_hook"].asString();
+		cfg_int(customized_config, "power_idle_ms", power_idle_ms,
+			POWER_IDLE_MS_MIN, INT_MAX);
 	}
+
+	// After option and config parsing, so both sources are honoured.
+	power_policy_start();
 
 	while (connect_device(vendor_id, product_id)) {
 		sleep(1);
