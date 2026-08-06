@@ -6,6 +6,7 @@
 #include "host-raw-gadget.h"
 #include "device-libusb.h"
 #include "misc.h"
+#include "power-policy.h"
 
 #ifdef HAVE_LUA
 extern "C" {
@@ -1902,6 +1903,7 @@ void *ep_loop_read(void *arg) {
 				// forwarded, not dropped.
 				if (rv == LIBUSB_SUCCESS ||
 				    (rv == LIBUSB_ERROR_TIMEOUT && nbytes > 0)) {
+					power_note_activity(nbytes);
 					// Mirror the OUT-side diagnostic on the IN stream so the
 					// log shows both halves of the ADB conversation (host
 					// WRTE/DATA vs device OKAY) — distinguishes "device never
@@ -2037,6 +2039,7 @@ void *ep_loop_read(void *arg) {
 			printf("EP%x(%s_%s): read %d bytes from host\n", ep.bEndpointAddress,
 					transfer_type.c_str(), dir.c_str(), rv);
 			io.inner.length = rv;
+			power_note_activity(rv);
 
 			// Advance/arm the fastboot download tracker (see the sizing
 			// logic above). A 17-byte "download:%08x" read arms it; payload
@@ -2316,6 +2319,10 @@ void ep0_loop(int fd) {
 
 		usb_raw_event_fetch(fd, (struct usb_raw_event *)&event);
 		log_event((struct usb_raw_event *)&event);
+		// Control traffic counts as activity too: enumeration and every
+		// interface/config change should wind the board up, not wait for
+		// the first bulk packet.
+		power_note_activity(1);
 
 		if (event.inner.length == 4294967295) {
 			printf("End for EP0, thread id(%d)\n", gettid());
