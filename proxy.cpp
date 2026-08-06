@@ -1590,7 +1590,21 @@ void *ep_loop_write(void *arg) {
 
 		std::unique_lock<std::mutex> lock(*data_mutex);
 		if (data_queue->empty()) {
-			data_cv->wait_for(lock, std::chrono::milliseconds(1));
+			// Sleep until there is something to write or we are asked
+			// to stop. A bare wait_for(1ms) here used to cost 1000
+			// wakeups/s per endpoint whether or not any data was
+			// flowing - on the appliance that was ~2000 wakeups/s and
+			// 3.3% CPU at complete idle, i.e. most of the proxy's idle
+			// power draw. The predicate is what wakes us; producers
+			// already notify on every push, and terminate_eps()
+			// notifies after setting the stop flags. The timeout is
+			// only a backstop against a missed notify wedging
+			// shutdown, so it can be long.
+			data_cv->wait_for(lock, std::chrono::milliseconds(250),
+				[&] {
+					return !data_queue->empty() ||
+						*please_stop || please_stop_eps;
+				});
 			if (data_queue->empty())
 				continue;
 		}
@@ -2248,6 +2262,11 @@ void terminate_eps(int fd, int config, int interface, int altsetting) {
 		struct raw_gadget_endpoint *ep = &alt->endpoints[i];
 		if (ep->thread_info.please_stop)
 			*ep->thread_info.please_stop = true;
+		// Wake the write thread, which sleeps on this condvar until the
+		// queue is non-empty or a stop flag is set (the flags above are
+		// part of its wait predicate).
+		if (ep->thread_info.data_cv)
+			ep->thread_info.data_cv->notify_all();
 		if (ep->thread_read)
 			pthread_kill(ep->thread_read, SIGUSR1);
 		if (ep->thread_write)
