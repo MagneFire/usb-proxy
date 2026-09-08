@@ -3,7 +3,11 @@
 #include <condition_variable>
 #include <chrono>
 
+#include <errno.h>
+#include <unistd.h>
+
 #include "device-libusb.h"
+#include "proxy.h"
 
 libusb_device 			**devs;
 libusb_device_handle 		*dev_handle;
@@ -15,12 +19,21 @@ struct libusb_config_descriptor		**device_config_desc;
 
 pthread_t hotplug_monitor_thread;
 
+// devtmpfs node of the opened device (/dev/bus/usb/BBB/DDD). The kernel removes
+// it the moment the device leaves the bus, and a device that comes back gets a
+// fresh address, so its absence is an unambiguous, bus-traffic-free "gone".
+static char device_node_path[32];
+
 int hotplug_callback(struct libusb_context *ctx __attribute__((unused)),
 			struct libusb_device *dev __attribute__((unused)),
 			libusb_hotplug_event envet __attribute__((unused)),
 			void *user_data __attribute__((unused))) {
-	printf("Hotplug event: device disconnected, stopping proxy...\n");
-	kill(0, SIGINT);
+	// Used to kill(0, SIGINT), which only sets the stop flags: the ep0 thread
+	// blocked in USB_RAW_IOCTL_EVENT_FETCH is not interrupted unless the signal
+	// happens to land on it, and even then main() ends in a pthread_join on
+	// this never-ending thread. Exit the way the endpoint threads do instead.
+	printf("Hotplug event: device disconnected, exiting usb-proxy\n");
+	drain_in_queues_and_exit();
 	return 0;
 }
 
@@ -33,6 +46,16 @@ void *hotplug_monitor(void *arg __attribute__((unused))) {
 		// lock contention that would otherwise starve ISO OUT sends.
 		struct timeval tv = {1, 0};
 		libusb_handle_events_timeout(context, &tv);
+
+		// Liveness check independent of traffic and of hotplug delivery:
+		// with the host idle and no endpoint thread running there may be
+		// no transfer to fail with NO_DEVICE, and the proxy would otherwise
+		// sit on a dead handle with the gadget still attached.
+		if (device_node_path[0] && access(device_node_path, F_OK) != 0 &&
+		    errno == ENOENT) {
+			printf("Device node %s gone, exiting usb-proxy\n", device_node_path);
+			drain_in_queues_and_exit();
+		}
 	}
 }
 
@@ -112,6 +135,11 @@ int connect_device(int vendor_id, int product_id) {
 	}
 
 	result = libusb_open(found, &dev_handle);
+	if (result == LIBUSB_SUCCESS) {
+		snprintf(device_node_path, sizeof(device_node_path),
+			"/dev/bus/usb/%03d/%03d",
+			libusb_get_bus_number(found), libusb_get_device_address(found));
+	}
 	libusb_free_device_list(devs, 1);
 	if (result != LIBUSB_SUCCESS) {
 		if (verbose_level) {
@@ -188,6 +216,14 @@ void reset_device() {
 	}
 }
 
+// The configuration/interface helpers run on the ep0 thread before any
+// endpoint thread exists, so a device that vanished underneath them has
+// nobody else to notice. Same exit as the endpoint threads.
+static void device_gone_exit(const char *where) {
+	printf("%s: device gone, exiting usb-proxy\n", where);
+	drain_in_queues_and_exit();
+}
+
 void set_configuration(int configuration) {
 	// The proxy host's kernel already configured the device at enumeration,
 	// so the host's SET_CONFIGURATION usually asks for the configuration the
@@ -202,6 +238,8 @@ void set_configuration(int configuration) {
 	// the bus.
 	int active = -1;
 	int result = libusb_get_configuration(dev_handle, &active);
+	if (result == LIBUSB_ERROR_NO_DEVICE)
+		device_gone_exit("set_configuration");
 	if (result == LIBUSB_SUCCESS && active == configuration) {
 		printf("Device already in configuration %d, not re-sending SET_CONFIGURATION\n",
 				configuration);
@@ -212,6 +250,8 @@ void set_configuration(int configuration) {
 	if (result != LIBUSB_SUCCESS) {
 		fprintf(stderr, "Error setting configuration(%d): %s\n",
 				configuration, libusb_strerror((libusb_error)result));
+		if (result == LIBUSB_ERROR_NO_DEVICE)
+			device_gone_exit("set_configuration");
 	}
 }
 
@@ -220,6 +260,8 @@ void claim_interface(int interface) {
 	if (result != LIBUSB_SUCCESS) {
 		fprintf(stderr, "Error claiming interface(%d): %s\n",
 				interface, libusb_strerror((libusb_error)result));
+		if (result == LIBUSB_ERROR_NO_DEVICE)
+			device_gone_exit("claim_interface");
 	}
 }
 
@@ -236,6 +278,8 @@ void set_interface_alt_setting(int interface, int altsetting) {
 	if (result != LIBUSB_SUCCESS) {
 		fprintf(stderr, "Error setting interface altsetting(%d, %d): %s\n",
 				interface, altsetting, libusb_strerror((libusb_error)result));
+		if (result == LIBUSB_ERROR_NO_DEVICE)
+			device_gone_exit("set_interface_alt_setting");
 	}
 }
 

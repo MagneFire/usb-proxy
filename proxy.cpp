@@ -1496,7 +1496,7 @@ void noop_signal_handler(int) { }
 // the gadget, which returns ESHUTDOWN, not NO_DEVICE) — so the threads doing
 // the draining are never the ones blocked here, and there is no self-deadlock.
 // First caller wins; concurrent callers block in call_once() until it _exit()s.
-static void drain_in_queues_and_exit(void)
+void drain_in_queues_and_exit(void)
 {
 	static std::once_flag once;
 	std::call_once(once, [] {
@@ -2445,6 +2445,16 @@ void ep0_loop(int fd) {
 					printf("ep0: transferred %d bytes (in)\n", rv);
 			}
 			else {
+				// The device dropping off the bus while only control traffic
+				// is in flight (host still enumerating, or right around
+				// SET_CONFIGURATION before any endpoint thread exists) used
+				// to leave the proxy stalling ep0 forever with a dead handle
+				// and the gadget still attached: no endpoint thread was there
+				// to hit NO_DEVICE and _exit. Exit here like they do.
+				if (result == LIBUSB_ERROR_NO_DEVICE) {
+					printf("ep0: device gone, exiting usb-proxy\n");
+					drain_in_queues_and_exit();
+				}
 				usb_raw_ep0_stall(fd);
 				continue;
 			}
@@ -2611,6 +2621,10 @@ void ep0_loop(int fd) {
 							printf("ep0: request acked\n");
 					}
 					else {
+						if (result == LIBUSB_ERROR_NO_DEVICE) {
+							printf("ep0: device gone, exiting usb-proxy\n");
+							drain_in_queues_and_exit();
+						}
 						// Stall the request.
 						usb_raw_ep0_stall(fd);
 						continue;
@@ -2639,6 +2653,10 @@ void ep0_loop(int fd) {
 					result = control_request(&event.ctrl, &nbytes, &control_data, USB_REQUEST_TIMEOUT);
 					if (result == 0) {
 						printf("ep0: transferred %d bytes (out)\n", rv);
+					}
+					else if (result == LIBUSB_ERROR_NO_DEVICE) {
+						printf("ep0: device gone, exiting usb-proxy\n");
+						drain_in_queues_and_exit();
 					}
 				}
 			}
