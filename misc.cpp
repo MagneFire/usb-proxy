@@ -1,7 +1,29 @@
 #include <math.h>
+#include <pthread.h>
+#include <signal.h>
 #include <time.h>
 
 #include "misc.h"
+
+void block_incidental_signals(bool keep_sigusr1)
+{
+	sigset_t set;
+	sigfillset(&set);
+	// A real shutdown must still interrupt a blocking ioctl.
+	sigdelset(&set, SIGINT);
+	sigdelset(&set, SIGTERM);
+	// Blocking a synchronous fault signal is undefined if the thread faults.
+	sigdelset(&set, SIGSEGV);
+	sigdelset(&set, SIGBUS);
+	sigdelset(&set, SIGFPE);
+	sigdelset(&set, SIGILL);
+	sigdelset(&set, SIGABRT);
+	sigdelset(&set, SIGTRAP);
+	sigdelset(&set, SIGSYS);
+	if (keep_sigusr1)
+		sigdelset(&set, SIGUSR1);
+	pthread_sigmask(SIG_BLOCK, &set, nullptr);
+}
 
 double uptime_s(void) {
 	struct timespec ts;

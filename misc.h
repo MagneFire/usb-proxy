@@ -33,6 +33,13 @@ extern int musb_out_read_packets;
 #define MUSB_OUT_READ_PACKETS_MAX 64
 extern bool gadget_is_musb;
 
+// Block every asynchronous signal on the calling thread except SIGINT/SIGTERM
+// (a real shutdown) and the synchronous fault signals; with keep_sigusr1 the
+// thread stays interruptible by pthread_kill(SIGUSR1) as well. For threads
+// that sleep in raw-gadget ioctls, which any stray signal would pop out of
+// with EINTR.
+void block_incidental_signals(bool keep_sigusr1);
+
 // Seconds since boot (CLOCK_MONOTONIC), the same clock dmesg stamps with, so
 // milestone log lines can be lined up with the kernel's USB events.
 double uptime_s(void);
