@@ -19,6 +19,13 @@ struct libusb_config_descriptor		**device_config_desc;
 
 pthread_t hotplug_monitor_thread;
 
+// Cleared at start; set to make hotplug_monitor return instead of looping
+// forever, so main()'s pthread_join(hotplug_monitor_thread) can complete and
+// the process exits cleanly when ep0_loop returns without having _exit()ed
+// (e.g. a shutdown signal interrupting the event fetch). Without this a normal
+// ep0_loop return deadlocks main on the join and the proxy wedges half-up.
+std::atomic<bool> please_stop_hotplug_monitor{false};
+
 // devtmpfs node of the opened device (/dev/bus/usb/BBB/DDD). The kernel removes
 // it the moment the device leaves the bus, and a device that comes back gets a
 // fresh address, so its absence is an unambiguous, bus-traffic-free "gone".
@@ -39,7 +46,7 @@ int hotplug_callback(struct libusb_context *ctx __attribute__((unused)),
 
 void *hotplug_monitor(void *arg __attribute__((unused))) {
 	printf("Start hotplug_monitor/event thread, thread id(%d)\n", gettid());
-	while(true) {
+	while(!please_stop_hotplug_monitor) {
 		// This is the SOLE thread that calls libusb_handle_events.
 		// All other threads (ISO IN, ISO OUT) submit async transfers
 		// and spin-wait on their completion flags.  This avoids event
@@ -57,6 +64,7 @@ void *hotplug_monitor(void *arg __attribute__((unused))) {
 			drain_in_queues_and_exit();
 		}
 	}
+	return nullptr;
 }
 
 int get_descriptor(libusb_device *device) {

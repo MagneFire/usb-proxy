@@ -2309,6 +2309,29 @@ void ep0_loop(int fd) {
 
 	printf("[%.3f] Start for EP0, thread id(%d)\n", uptime_s(), gettid());
 
+	// Run the control loop deaf to incidental signals. USB_RAW_IOCTL_EVENT_FETCH
+	// sleeps in the kernel's down_interruptible(), so ANY signal delivered to
+	// this thread pops it out with -EINTR (reported as length == UINT_MAX) and
+	// tears down an otherwise healthy proxy mid-enumeration -- the power hook's
+	// child reaping was seen doing exactly this right after "host connected",
+	// wedging the gadget half-configured. Block every asynchronous signal here;
+	// leave the synchronous fault signals deliverable (blocking them is undefined
+	// if the thread faults) and leave SIGINT/SIGTERM deliverable so a real
+	// shutdown still interrupts the fetch. Only this thread's mask changes; the
+	// power_monitor thread keeps its own.
+	sigset_t block_set;
+	sigfillset(&block_set);
+	sigdelset(&block_set, SIGINT);
+	sigdelset(&block_set, SIGTERM);
+	sigdelset(&block_set, SIGSEGV);
+	sigdelset(&block_set, SIGBUS);
+	sigdelset(&block_set, SIGFPE);
+	sigdelset(&block_set, SIGILL);
+	sigdelset(&block_set, SIGABRT);
+	sigdelset(&block_set, SIGTRAP);
+	sigdelset(&block_set, SIGSYS);
+	pthread_sigmask(SIG_BLOCK, &block_set, nullptr);
+
 	if (verbose_level)
 		print_eps_info(fd);
 
@@ -2327,7 +2350,19 @@ void ep0_loop(int fd) {
 		power_note_activity(1);
 
 		if (event.inner.length == 4294967295) {
-			printf("End for EP0, thread id(%d)\n", gettid());
+			// Event fetch interrupted by a signal. With the mask above only
+			// SIGINT/SIGTERM reach here, i.e. a real shutdown; log which so
+			// the hardware run confirms nothing else is leaking through.
+			sigset_t pending;
+			sigemptyset(&pending);
+			sigpending(&pending);
+			printf("End for EP0, thread id(%d) (fetch interrupted; "
+			       "SIGINT=%d SIGTERM=%d)\n", gettid(),
+			       sigismember(&pending, SIGINT),
+			       sigismember(&pending, SIGTERM));
+			// Let main()'s pthread_join(hotplug_monitor_thread) complete so the
+			// process exits (and inittab respawns) instead of wedging forever.
+			please_stop_hotplug_monitor = true;
 			return;
 		}
 

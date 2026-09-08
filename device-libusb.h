@@ -48,6 +48,8 @@ extern struct libusb_device_descriptor		device_device_desc;
 extern struct libusb_config_descriptor		**device_config_desc;
 
 extern pthread_t hotplug_monitor_thread;
+// Set to make hotplug_monitor return so main() can join it and exit cleanly.
+extern std::atomic<bool> please_stop_hotplug_monitor;
 
 int connect_device(int vendorId, int productId);
 void reset_device();

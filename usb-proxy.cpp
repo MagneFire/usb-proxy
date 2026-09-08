@@ -770,6 +770,11 @@ int main(int argc, char **argv)
 
 	ep0_loop(fd);
 
+	// ep0_loop returned without _exit()ing (a shutdown signal, not a device
+	// disconnect). Tell hotplug_monitor to stop so the join below completes;
+	// otherwise it loops forever and main() wedges here with the gadget half-up.
+	please_stop_hotplug_monitor = true;
+
 	close(fd);
 
 	int bNumConfigurations = device_device_desc.bNumConfigurations;
