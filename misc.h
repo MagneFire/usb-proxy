@@ -33,5 +33,9 @@ extern int musb_out_read_packets;
 #define MUSB_OUT_READ_PACKETS_MAX 64
 extern bool gadget_is_musb;
 
+// Seconds since boot (CLOCK_MONOTONIC), the same clock dmesg stamps with, so
+// milestone log lines can be lined up with the kernel's USB events.
+double uptime_s(void);
+
 std::string hexToAscii(std::string input);
 int hexToDecimal(int input);
