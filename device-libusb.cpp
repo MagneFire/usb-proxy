@@ -70,7 +70,7 @@ int get_descriptor(libusb_device *device) {
 		return result;
 	}
 
-	device_config_desc = new struct libusb_config_descriptor *[device_device_desc.bNumConfigurations];
+	device_config_desc = new struct libusb_config_descriptor *[device_device_desc.bNumConfigurations]();
 	for (int i = 0; i < device_device_desc.bNumConfigurations; i++) {
 		result = libusb_get_config_descriptor(device, i, &device_config_desc[i]);
 		if (result != LIBUSB_SUCCESS) {
@@ -85,17 +85,48 @@ int get_descriptor(libusb_device *device) {
 	return LIBUSB_SUCCESS;
 }
 
+int device_settle_ms = 0;
+
+// Undo a partial connect so the caller can simply retry: close the handle and
+// drop the config descriptors get_descriptor() allocated for this attempt.
+static void drop_device_attempt(void) {
+	if (dev_handle) {
+		libusb_close(dev_handle);
+		dev_handle = NULL;
+	}
+	if (device_config_desc) {
+		for (int i = 0; i < device_device_desc.bNumConfigurations; i++)
+			if (device_config_desc[i])
+				libusb_free_config_descriptor(device_config_desc[i]);
+		delete[] device_config_desc;
+		device_config_desc = NULL;
+	}
+	device_node_path[0] = '\0';
+}
+
 int connect_device(int vendor_id, int product_id) {
 	int result;
-	result = libusb_init(&context);
-	if (result < 0) {
-		fprintf(stderr, "Init error: %s\n", libusb_strerror((libusb_error)result));
-		return 1;
+	if (!context) {
+		result = libusb_init(&context);
+		if (result < 0) {
+			fprintf(stderr, "Init error: %s\n", libusb_strerror((libusb_error)result));
+			context = NULL;
+			return 1;
+		}
+		libusb_set_debug(context, 3);
 	}
-	libusb_set_debug(context, 3);
 
 	libusb_device *found = NULL;
+	bool announced = false;
 
+	// Wait here for a device rather than exiting and being respawned by a
+	// polling launcher. Measured on the appliance: a launcher cycle of
+	// `sleep 2; exit` plus init's respawn cost ~3 s, so a device that came back
+	// waited 0-3 s after the kernel had enumerated it before the proxy even
+	// started, and the Mac then saw it ~3.8 s after enumeration versus 1.2 s
+	// when the proxy was already waiting. A device-list scan is a sysfs
+	// readdir plus a handful of reads (~5 ms at 648 MHz), so a 100 ms poll is
+	// free and reacts within a poll period.
 	while (found == NULL) {
 		int cnt = libusb_get_device_list(context, &devs);
 		if (cnt < 0) {
@@ -103,50 +134,88 @@ int connect_device(int vendor_id, int product_id) {
 					libusb_strerror((libusb_error)cnt));
 			return 1;
 		}
-		if (verbose_level)
+		if (verbose_level > 1)
 			printf("%d Devices in list\n", cnt);
 
 		for (int i = 0; i < cnt; i++) {
 			libusb_device *dvc = devs[i];
-			result = get_descriptor(dvc);
-			if (result != LIBUSB_SUCCESS)
+			// Device descriptor only (cached by libusb, no allocation):
+			// the config descriptors are fetched once, for the device
+			// actually chosen, so an idle poll allocates nothing.
+			struct libusb_device_descriptor desc;
+			if (libusb_get_device_descriptor(dvc, &desc) != LIBUSB_SUCCESS)
 				continue;
 
-			if (device_device_desc.bDeviceClass == LIBUSB_CLASS_HUB)
+			if (desc.bDeviceClass == LIBUSB_CLASS_HUB)
 				continue;
 
 			if (vendor_id == -1 && product_id == -1) {
 				found = dvc;
 				break;
 			}
-			else if ((vendor_id == device_device_desc.idVendor || vendor_id == LIBUSB_HOTPLUG_MATCH_ANY) &&
-				(product_id == device_device_desc.idProduct || product_id == LIBUSB_HOTPLUG_MATCH_ANY)) {
+			else if ((vendor_id == desc.idVendor || vendor_id == LIBUSB_HOTPLUG_MATCH_ANY) &&
+				(product_id == desc.idProduct || product_id == LIBUSB_HOTPLUG_MATCH_ANY)) {
 				found = dvc;
 				break;
 			}
 		}
 
 		if (!found) {
-			if (verbose_level && vendor_id != -1 && product_id != -1)
-				printf("Target device not found\n");
+			if (!announced) {
+				printf("[%.3f] no USB device to proxy yet; polling every %d ms\n",
+					uptime_s(), DEVICE_POLL_MS);
+				announced = true;
+			}
 			libusb_free_device_list(devs, 1);
-			sleep(1);
+			usleep(DEVICE_POLL_MS * 1000);
 		}
 	}
 
-	result = libusb_open(found, &dev_handle);
-	if (result == LIBUSB_SUCCESS) {
-		snprintf(device_node_path, sizeof(device_node_path),
-			"/dev/bus/usb/%03d/%03d",
-			libusb_get_bus_number(found), libusb_get_device_address(found));
+	snprintf(device_node_path, sizeof(device_node_path),
+		"/dev/bus/usb/%03d/%03d",
+		libusb_get_bus_number(found), libusb_get_device_address(found));
+	printf("[%.3f] device found: %s%s\n", uptime_s(), device_node_path,
+		device_settle_ms > 0 ? " (settling)" : "");
+
+	// Settle debounce (opt-in, --settle_ms). The watch re-enumerates several
+	// times on a cradle attach (instances living 2.2 s, 0.33 s, then the real
+	// one) and once more around each reboot. Proxying a transient one puts the
+	// host through a pointless enumerate/vanish cycle -- the recorded trigger
+	// for macOS keeping a stale device object -- so a newly appeared device
+	// must survive the settle before the gadget attaches. The devtmpfs node is
+	// the liveness test: the kernel removes it the instant the device leaves,
+	// and a returning device gets a new address, so no bus traffic is needed.
+	if (device_settle_ms > 0) {
+		usleep(device_settle_ms * 1000);
+		if (access(device_node_path, F_OK) != 0) {
+			printf("Device %s vanished during the %d ms settle; waiting for the next one\n",
+				device_node_path, device_settle_ms);
+			libusb_free_device_list(devs, 1);
+			device_node_path[0] = '\0';
+			return 1;
+		}
 	}
+
+	result = get_descriptor(found);
+	if (verbose_level)
+		printf("[%.3f] descriptors read\n", uptime_s());
+	if (result != LIBUSB_SUCCESS) {
+		libusb_free_device_list(devs, 1);
+		drop_device_attempt();
+		return result;
+	}
+
+	result = libusb_open(found, &dev_handle);
 	libusb_free_device_list(devs, 1);
+	if (verbose_level)
+		printf("[%.3f] libusb_open done (%d)\n", uptime_s(), result);
 	if (result != LIBUSB_SUCCESS) {
 		if (verbose_level) {
 			fprintf(stderr, "Error opening device handle: %s\n",
 					libusb_strerror((libusb_error)result));
 		}
 		dev_handle = NULL;
+		drop_device_attempt();
 		return result;
 	}
 
@@ -154,14 +223,18 @@ int connect_device(int vendor_id, int product_id) {
 	if (result != LIBUSB_SUCCESS) {
 		fprintf(stderr, "libusb_set_auto_detach_kernel_driver() failed: %s\n",
 				libusb_strerror((libusb_error)result));
+		drop_device_attempt();
 		return result;
 	}
 
 	int config = 0;
 	result = libusb_get_configuration(dev_handle, &config);
+	if (verbose_level)
+		printf("[%.3f] get_configuration done (%d)\n", uptime_s(), result);
 	if (result != LIBUSB_SUCCESS) {
 		fprintf(stderr, "libusb_get_configuration() failed: %s\n",
 				libusb_strerror((libusb_error)result));
+		drop_device_attempt();
 		return result;
 	}
 
@@ -177,16 +250,22 @@ int connect_device(int vendor_id, int product_id) {
 		if (result != LIBUSB_SUCCESS) {
 			fprintf(stderr, "libusb_reset_device() failed: %s\n",
 					libusb_strerror((libusb_error)result));
+			drop_device_attempt();
 			return result;
 		}
 	}
 
 	//check that device is responsive
 	unsigned char unused[4];
+	if (verbose_level)
+		printf("[%.3f] kernel drivers detached; probing string descriptor 0\n", uptime_s());
 	result = libusb_get_string_descriptor(dev_handle, 0, 0, unused, sizeof(unused));
+	if (verbose_level)
+		printf("[%.3f] string descriptor probe done (%d)\n", uptime_s(), result);
 	if (result < 0) {
 		fprintf(stderr, "Device unresponsive: %s\n",
 				libusb_strerror((libusb_error)result));
+		drop_device_attempt();
 		return result;
 	}
 

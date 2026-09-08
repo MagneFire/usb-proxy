@@ -6,6 +6,14 @@
 
 #define MAX_ATTEMPTS 5
 
+// connect_device() waits in-process for a device to proxy, scanning the
+// device list at this interval (sysfs only, no bus traffic).
+#define DEVICE_POLL_MS 100
+
+// --settle_ms: a newly found device must still be present after this long
+// before it is opened and the gadget attached (0 = attach immediately).
+extern int device_settle_ms;
+
 #define ISO_BATCH_SIZE_DEFAULT 8
 #define ISO_BATCH_SIZE_MAX 32
 

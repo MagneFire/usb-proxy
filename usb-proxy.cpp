@@ -151,6 +151,8 @@ void usage() {
 	printf("\t                   its CPU down while nothing is happening (default: disabled)\n");
 	printf("\t--power_idle_ms N: quiet period before `power_hook idle` runs (default %d)\n",
 		power_idle_ms);
+	printf("\t--settle_ms N: a newly appeared device must survive N ms before the gadget\n");
+	printf("\t               attaches (skips transient re-enumerations; default 0 = at once)\n");
 	printf("* If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.\n");
 	printf("* If `driver` not specified, `usb-proxy` will use `dummy_udc` as default driver.\n");
 	printf("* If both `vendor_id` and `product_id` not specified, `usb-proxy` will connect\n");
@@ -516,6 +518,7 @@ int main(int argc, char **argv)
 		{"adb_ack_accel", no_argument, &lopt, 15},
 		{"power_hook", required_argument, &lopt, 16},
 		{"power_idle_ms", required_argument, &lopt, 17},
+		{"settle_ms", required_argument, &lopt, 18},
 		{0, 0, 0, 0}
 	};
 	while ((opt = getopt_long(argc, argv, optstring, long_options, &loidx)) != -1) {
@@ -600,6 +603,13 @@ int main(int argc, char **argv)
 			power_idle_ms = std::stoi(optarg);
 			if (power_idle_ms < POWER_IDLE_MS_MIN)
 				power_idle_ms = POWER_IDLE_MS_MIN;
+			break;
+		case 18:
+			device_settle_ms = std::stoi(optarg);
+			if (device_settle_ms < 0)
+				device_settle_ms = 0;
+			if (device_settle_ms > 0)
+				printf("Device settle set to %d ms\n", device_settle_ms);
 			break;
 
 		default:
@@ -707,10 +717,16 @@ int main(int argc, char **argv)
 	// After option and config parsing, so both sources are honoured.
 	power_policy_start();
 
+	// connect_device() itself waits for a device to appear; a non-zero return
+	// is a failed attempt on one that is there (or vanished mid-attempt), so
+	// retry quickly rather than adding a second to every enumeration.
 	while (connect_device(vendor_id, product_id)) {
-		sleep(1);
+		usleep(200 * 1000);
 	}
-	printf("Device opened successfully\n");
+	printf("[%.3f] Device opened successfully\n", uptime_s());
+	// The board may have wound down while waiting; the host's enumeration
+	// burst is imminent, so wind up now rather than on its first ep0 event.
+	power_note_activity(1);
 
 	// Detect physical device speed.
 	int libusb_speed = libusb_get_device_speed(libusb_get_device(dev_handle));

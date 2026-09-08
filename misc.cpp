@@ -1,6 +1,13 @@
 #include <math.h>
+#include <time.h>
 
 #include "misc.h"
+
+double uptime_s(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
 
 std::string hexToAscii(std::string input) {
 	std::string output = input;

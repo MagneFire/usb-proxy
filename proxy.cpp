@@ -2307,7 +2307,7 @@ void terminate_eps(int fd, int config, int interface, int altsetting) {
 void ep0_loop(int fd) {
 	bool set_configuration_done_once = false;
 
-	printf("Start for EP0, thread id(%d)\n", gettid());
+	printf("[%.3f] Start for EP0, thread id(%d)\n", uptime_s(), gettid());
 
 	if (verbose_level)
 		print_eps_info(fd);
@@ -2319,6 +2319,8 @@ void ep0_loop(int fd) {
 
 		usb_raw_event_fetch(fd, (struct usb_raw_event *)&event);
 		log_event((struct usb_raw_event *)&event);
+		if (event.inner.type == USB_RAW_EVENT_CONNECT)
+			printf("[%.3f] host connected to the gadget\n", uptime_s());
 		// Control traffic counts as activity too: enumeration and every
 		// interface/config change should wind the board up, not wait for
 		// the first bulk packet.
@@ -2488,6 +2490,7 @@ void ep0_loop(int fd) {
 					}
 				}
 
+				printf("[%.3f] host SET_CONFIGURATION %d\n", uptime_s(), event.ctrl.wValue);
 				usb_raw_configure(fd);
 				set_configuration(config->config.bConfigurationValue);
 				host_device_desc.current_config = desired_config;
