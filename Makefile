@@ -51,7 +51,7 @@ LDFLAG=-lusb-1.0 -pthread -ljsoncpp -lutil $(LUA_LIBS)
 .PHONY: all clean
 
 OBJS=usb-proxy.o host-raw-gadget.o device-libusb.o proxy.o misc.o power-policy.o \
-     console-acm.o console-shell.o gadget-idle.o
+     console-acm.o console-shell.o gadget-idle.o gadget-fixed.o bridge.o
 
 usb-proxy: $(OBJS)
 	g++ $(OBJS) $(LDFLAG) -o usb-proxy

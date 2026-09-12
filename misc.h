@@ -45,6 +45,12 @@ extern std::string usb_console_shell;
 // UDC the gadget binds to (--driver / --device), for the idle gadget.
 extern const char *gadget_driver;
 extern const char *gadget_device;
+// Persistent gadget (gadget-fixed.cpp, bridge.cpp): one fixed gadget for the
+// life of the process, the proxied device's bulk endpoints bridged onto it.
+extern bool persistent_gadget;
+extern int gadget_vendor_id;
+extern int gadget_product_id;
+extern std::string gadget_serial;
 
 // Installed for SIGUSR1: interrupts a blocking raw-gadget ioctl, nothing else.
 void noop_signal_handler(int);

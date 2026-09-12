@@ -9,6 +9,7 @@
 #include "power-policy.h"
 #include "console-acm.h"
 #include "console-shell.h"
+#include "bridge.h"
 
 #ifdef HAVE_LUA
 extern "C" {
@@ -1506,63 +1507,62 @@ static void unblock_sigusr1_here(void)
 // the gadget, which returns ESHUTDOWN, not NO_DEVICE) — so the threads doing
 // the draining are never the ones blocked here, and there is no self-deadlock.
 // First caller wins; concurrent callers block in call_once() until it _exit()s.
+bool drain_in_queues(void)
+{
+	int cfg_idx = host_device_desc.current_config;
+	if (cfg_idx < 0)
+		return true;
+	struct raw_gadget_config *config = &host_device_desc.configs[cfg_idx];
+
+	auto in_queues_empty = [&]() {
+		for (int i = 0; i < config->config.bNumInterfaces; i++) {
+			struct raw_gadget_interface *iface = &config->interfaces[i];
+			struct raw_gadget_altsetting *alt =
+				&iface->altsettings[iface->current_altsetting];
+			for (int k = 0; k < alt->interface.bNumEndpoints; k++) {
+				struct raw_gadget_endpoint *ep = &alt->endpoints[k];
+				if (!usb_endpoint_dir_in(&ep->endpoint))
+					continue;
+				if (usb_endpoint_type(&ep->endpoint) == USB_ENDPOINT_XFER_ISOC)
+					continue;
+				std::mutex *m = ep->thread_info.data_mutex;
+				std::deque<usb_raw_transfer_io> *q = ep->thread_info.data_queue;
+				if (!m || !q)
+					continue;
+				std::lock_guard<std::mutex> guard(*m);
+				if (!q->empty())
+					return false;
+			}
+		}
+		return true;
+	};
+
+	// Wait for the queues to empty, then confirm they stay empty across a
+	// short settle. Two reasons a single "empty" glimpse is not enough:
+	// an OKAY that an IN read thread pulled a hair before the disconnect
+	// was noticed elsewhere may still be a few microseconds from being
+	// enqueued; and "empty" only means the writer has *popped* the last
+	// transfer, so the settle doubles as time for its in-flight
+	// usb_raw_ep_write() to actually reach the host.
+	const auto deadline = std::chrono::steady_clock::now() +
+			      std::chrono::milliseconds(300);
+	while (std::chrono::steady_clock::now() < deadline) {
+		if (in_queues_empty()) {
+			usleep(30000);
+			if (in_queues_empty())
+				return true;
+			continue;
+		}
+		usleep(2000);
+	}
+	return false;
+}
+
 void drain_in_queues_and_exit(void)
 {
 	static std::once_flag once;
 	std::call_once(once, [] {
-		int cfg_idx = host_device_desc.current_config;
-		if (cfg_idx < 0) {
-			shell_kill();
-			fflush(stdout);
-			_exit(0);
-		}
-		struct raw_gadget_config *config = &host_device_desc.configs[cfg_idx];
-
-		auto in_queues_empty = [&]() {
-			for (int i = 0; i < config->config.bNumInterfaces; i++) {
-				struct raw_gadget_interface *iface = &config->interfaces[i];
-				struct raw_gadget_altsetting *alt =
-					&iface->altsettings[iface->current_altsetting];
-				for (int k = 0; k < alt->interface.bNumEndpoints; k++) {
-					struct raw_gadget_endpoint *ep = &alt->endpoints[k];
-					if (!usb_endpoint_dir_in(&ep->endpoint))
-						continue;
-					if (usb_endpoint_type(&ep->endpoint) == USB_ENDPOINT_XFER_ISOC)
-						continue;
-					std::mutex *m = ep->thread_info.data_mutex;
-					std::deque<usb_raw_transfer_io> *q = ep->thread_info.data_queue;
-					if (!m || !q)
-						continue;
-					std::lock_guard<std::mutex> guard(*m);
-					if (!q->empty())
-						return false;
-				}
-			}
-			return true;
-		};
-
-		// Wait for the queues to empty, then confirm they stay empty across a
-		// short settle. Two reasons a single "empty" glimpse is not enough:
-		// an OKAY that an IN read thread pulled a hair before the disconnect
-		// was noticed elsewhere may still be a few microseconds from being
-		// enqueued; and "empty" only means the writer has *popped* the last
-		// transfer, so the settle doubles as time for its in-flight
-		// usb_raw_ep_write() to actually reach the host.
-		const auto deadline = std::chrono::steady_clock::now() +
-				      std::chrono::milliseconds(300);
-		bool drained = false;
-		while (std::chrono::steady_clock::now() < deadline) {
-			if (in_queues_empty()) {
-				usleep(30000);
-				if (in_queues_empty()) {
-					drained = true;
-					break;
-				}
-				continue;
-			}
-			usleep(2000);
-		}
-
+		bool drained = drain_in_queues();
 		if (verbose_level > 0)
 			fprintf(stderr, "[drain] device gone; IN queues %s, exiting\n",
 				drained ? "flushed" : "flush timed out");
@@ -1576,6 +1576,18 @@ void drain_in_queues_and_exit(void)
 	// spurious return can never fall back into a read/write loop.
 	for (;;)
 		pause();
+}
+
+void device_lost(const char *where)
+{
+	if (!persistent_gadget) {
+		printf("%s: device gone, exiting usb-proxy\n", where);
+		drain_in_queues_and_exit();
+	}
+	// Persistent gadget: the gadget stays up; the device manager unbinds the
+	// bridge and waits for the next device. Idempotent and non-blocking, so
+	// every thread that notices the loss may call it.
+	bridge_note_device_lost(where);
 }
 
 void *ep_loop_write(void *arg) {
@@ -1672,15 +1684,9 @@ void *ep_loop_write(void *arg) {
 						       data, length, USB_REQUEST_TIMEOUT);
 				if (rv == LIBUSB_ERROR_NO_DEVICE) {
 					delete[] data;
-					printf("EP%x(%s_%s): device gone, exiting usb-proxy\n",
+					printf("EP%x(%s_%s): device gone\n",
 						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
-					/* The proxied device is gone. libusb hotplug does not fire
-					 * without udev, and SIGINT-based shutdown can hang because
-					 * the EP0 loop is blocked on the still-connected host side.
-					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
-					 * the UDC) and the service manager respawns us to re-proxy
-					 * on replug. */
-					drain_in_queues_and_exit();
+					device_lost("endpoint thread");
 					break;
 				}
 				if (rv != LIBUSB_SUCCESS)
@@ -1695,15 +1701,9 @@ void *ep_loop_write(void *arg) {
 				int rv = send_data_async(thread_info.device_bEndpointAddress,
 							 data, length, USB_REQUEST_TIMEOUT);
 				if (rv == LIBUSB_ERROR_NO_DEVICE) {
-					printf("EP%x(%s_%s): device gone, exiting usb-proxy\n",
+					printf("EP%x(%s_%s): device gone\n",
 						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
-					/* The proxied device is gone. libusb hotplug does not fire
-					 * without udev, and SIGINT-based shutdown can hang because
-					 * the EP0 loop is blocked on the still-connected host side.
-					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
-					 * the UDC) and the service manager respawns us to re-proxy
-					 * on replug. */
-					drain_in_queues_and_exit();
+					device_lost("endpoint thread");
 					break;
 				}
 			} else {
@@ -1711,15 +1711,9 @@ void *ep_loop_write(void *arg) {
 						   data, length, USB_REQUEST_TIMEOUT);
 				if (rv == LIBUSB_ERROR_NO_DEVICE) {
 					delete[] data;
-					printf("EP%x(%s_%s): device gone, exiting usb-proxy\n",
+					printf("EP%x(%s_%s): device gone\n",
 						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
-					/* The proxied device is gone. libusb hotplug does not fire
-					 * without udev, and SIGINT-based shutdown can hang because
-					 * the EP0 loop is blocked on the still-connected host side.
-					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
-					 * the UDC) and the service manager respawns us to re-proxy
-					 * on replug. */
-					drain_in_queues_and_exit();
+					device_lost("endpoint thread");
 					break;
 				}
 				// send_data() only returns non-SUCCESS for fatal errors now
@@ -1815,15 +1809,9 @@ void *ep_loop_read(void *arg) {
 								usb_endpoint_maxp(&ep),
 								&batch, iso_batch_size, USB_REQUEST_TIMEOUT);
 				if (rv == LIBUSB_ERROR_NO_DEVICE) {
-					printf("EP%x(%s_%s): device gone, exiting usb-proxy\n",
+					printf("EP%x(%s_%s): device gone\n",
 						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
-					/* The proxied device is gone. libusb hotplug does not fire
-					 * without udev, and SIGINT-based shutdown can hang because
-					 * the EP0 loop is blocked on the still-connected host side.
-					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
-					 * the UDC) and the service manager respawns us to re-proxy
-					 * on replug. */
-					drain_in_queues_and_exit();
+					device_lost("endpoint thread");
 					break;
 				}
 
@@ -1887,15 +1875,9 @@ void *ep_loop_read(void *arg) {
 							&data, &nbytes, USB_REQUEST_TIMEOUT,
 							read_len);
 				if (rv == LIBUSB_ERROR_NO_DEVICE) {
-					printf("EP%x(%s_%s): device gone, exiting usb-proxy\n",
+					printf("EP%x(%s_%s): device gone\n",
 						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
-					/* The proxied device is gone. libusb hotplug does not fire
-					 * without udev, and SIGINT-based shutdown can hang because
-					 * the EP0 loop is blocked on the still-connected host side.
-					 * Terminate now; the kernel closes /dev/raw-gadget (freeing
-					 * the UDC) and the service manager respawns us to re-proxy
-					 * on replug. */
-					drain_in_queues_and_exit();
+					device_lost("endpoint thread");
 					if (data)
 						delete[] data;
 					break;
@@ -2113,6 +2095,23 @@ void *ep_loop_read(void *arg) {
 				continue;
 			}
 
+			// Persistent gadget: keep the host->device adb stream framed
+			// across device binds (bridge.cpp). The stream lock is held
+			// until this read has been forwarded or dropped.
+			struct OutGuard {
+				bool on;
+				~OutGuard() { if (on) bridge_out_done(); }
+			} out_guard{false};
+			if (persistent_gadget && rv > 0 &&
+			    (ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK) {
+				out_guard.on = true;
+				if (!bridge_out_feed((const uint8_t *)io.data, rv)) {
+					printf("EP%x(%s_%s): %d bytes dropped (bridge re-sync)\n",
+						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str(), rv);
+					continue;
+				}
+			}
+
 			if (injection_enabled)
 				injection(io, thread_info.device_bEndpointAddress, transfer_type);
 
@@ -2148,12 +2147,10 @@ void *ep_loop_read(void *arg) {
 				int arv = send_data_async(thread_info.device_bEndpointAddress,
 							  data, length, USB_REQUEST_TIMEOUT);
 				if (arv == LIBUSB_ERROR_NO_DEVICE) {
-					printf("EP%x(%s_%s): device gone, exiting usb-proxy\n",
+					printf("EP%x(%s_%s): device gone\n",
 						ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
-					/* Same rationale as the write-thread path: no udev, so
-					 * hotplug doesn't fire; terminate and let the service
-					 * manager respawn us on replug. */
-					drain_in_queues_and_exit();
+					device_lost("endpoint thread");
+					break;
 				}
 				// If this read completed a host->device message, parked
 				// device-bound spoofs may now follow it out.
@@ -2177,18 +2174,10 @@ void *ep_loop_read(void *arg) {
 	return NULL;
 }
 
-void process_eps(int fd, int config, int interface, int altsetting) {
-	struct raw_gadget_altsetting *alt = &host_device_desc.configs[config]
-					.interfaces[interface].altsettings[altsetting];
-
-	printf("Activating %d endpoints on interface %d\n", (int)alt->interface.bNumEndpoints, interface);
-
-	// Endpoint (re)activation voids any previous ADB session bookkeeping.
-	ack_accel.reset();
-
-	// Pass 1: set up all endpoint state and enable the endpoints. Threads are
-	// only created in pass 2, so cross-endpoint links (peer_in) are complete
-	// before any thread can dereference them.
+// Fill the per-endpoint descriptive state (type/dir strings, the gadget
+// endpoint descriptor) and enable the endpoints on the UDC. Nothing here
+// depends on a proxied device being present.
+void eps_enable(int fd, struct raw_gadget_altsetting *alt) {
 	for (int i = 0; i < alt->interface.bNumEndpoints; i++) {
 		struct raw_gadget_endpoint *ep = &alt->endpoints[i];
 
@@ -2197,13 +2186,6 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 
 		ep->thread_info.fd = fd;
 		ep->thread_info.endpoint = ep->endpoint;
-		ep->thread_info.device_bEndpointAddress = ep->device_bEndpointAddress;
-		ep->thread_info.data_queue = new std::deque<usb_raw_transfer_io>;
-		ep->thread_info.data_mutex = new std::mutex;
-		ep->thread_info.data_cv = new std::condition_variable;
-		ep->thread_info.please_stop = new std::atomic<bool>(false);
-		ep->thread_info.peer_in = NULL;
-		ep->thread_info.peer_out = NULL;
 
 		switch (usb_endpoint_type(&ep->endpoint)) {
 		case USB_ENDPOINT_XFER_ISOC:
@@ -2230,6 +2212,30 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 			ep->thread_info.transfer_type.c_str(),
 			ep->thread_info.dir.c_str(),
 			addr, ep->thread_info.ep_num);
+	}
+}
+
+// Start forwarding on already-enabled endpoints: the queues, the bulk peer
+// links and the read/write threads. Uses each endpoint's current
+// device_bEndpointAddress, so the persistent gadget sets those first.
+void eps_start(int fd, struct raw_gadget_altsetting *alt) {
+	(void)fd;
+	// Endpoint (re)activation voids any previous ADB session bookkeeping.
+	ack_accel.reset();
+
+	// Pass 1: set up all endpoint state. Threads are only created in pass 2,
+	// so cross-endpoint links (peer_in) are complete before any thread can
+	// dereference them.
+	for (int i = 0; i < alt->interface.bNumEndpoints; i++) {
+		struct raw_gadget_endpoint *ep = &alt->endpoints[i];
+		assert(ep->thread_info.ep_num >= 0);
+		ep->thread_info.device_bEndpointAddress = ep->device_bEndpointAddress;
+		ep->thread_info.data_queue = new std::deque<usb_raw_transfer_io>;
+		ep->thread_info.data_mutex = new std::mutex;
+		ep->thread_info.data_cv = new std::condition_variable;
+		ep->thread_info.please_stop = new std::atomic<bool>(false);
+		ep->thread_info.peer_in = NULL;
+		ep->thread_info.peer_out = NULL;
 	}
 
 	// Link the altsetting's bulk OUT and bulk IN endpoints to each other:
@@ -2269,14 +2275,22 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 		pthread_create(&ep->thread_write, 0,
 			ep_loop_write, (void *)&ep->thread_info);
 	}
-
-	printf("process_eps done\n");
 }
 
-void terminate_eps(int fd, int config, int interface, int altsetting) {
+void process_eps(int fd, int config, int interface, int altsetting) {
 	struct raw_gadget_altsetting *alt = &host_device_desc.configs[config]
 					.interfaces[interface].altsettings[altsetting];
 
+	printf("Activating %d endpoints on interface %d\n", (int)alt->interface.bNumEndpoints, interface);
+	eps_enable(fd, alt);
+	eps_start(fd, alt);
+	printf("process_eps done\n");
+}
+
+// Stop and join the forwarding threads of an altsetting and free their
+// queues; the endpoints stay enabled (a bulk endpoint with nothing queued
+// NAKs the host).
+void eps_stop(struct raw_gadget_altsetting *alt) {
 	// Phase 1: Signal all threads to stop and interrupt blocking calls.
 	// Set per-endpoint stop flags (not global - only affects this interface's threads).
 	// Send SIGUSR1 to interrupt threads blocked on Raw Gadget ioctls.
@@ -2312,9 +2326,6 @@ void terminate_eps(int fd, int config, int interface, int altsetting) {
 	// Phase 3: Clean up resources after all threads have exited.
 	for (int i = 0; i < alt->interface.bNumEndpoints; i++) {
 		struct raw_gadget_endpoint *ep = &alt->endpoints[i];
-		usb_raw_ep_disable(fd, ep->thread_info.ep_num);
-		ep->thread_info.ep_num = -1;
-
 		delete ep->thread_info.data_queue;
 		delete ep->thread_info.data_mutex;
 		delete ep->thread_info.data_cv;
@@ -2324,6 +2335,22 @@ void terminate_eps(int fd, int config, int interface, int altsetting) {
 		ep->thread_info.data_cv = nullptr;
 		ep->thread_info.please_stop = nullptr;
 	}
+}
+
+void eps_disable(int fd, struct raw_gadget_altsetting *alt) {
+	for (int i = 0; i < alt->interface.bNumEndpoints; i++) {
+		struct raw_gadget_endpoint *ep = &alt->endpoints[i];
+		if (ep->thread_info.ep_num >= 0)
+			usb_raw_ep_disable(fd, ep->thread_info.ep_num);
+		ep->thread_info.ep_num = -1;
+	}
+}
+
+void terminate_eps(int fd, int config, int interface, int altsetting) {
+	struct raw_gadget_altsetting *alt = &host_device_desc.configs[config]
+					.interfaces[interface].altsettings[altsetting];
+	eps_stop(alt);
+	eps_disable(fd, alt);
 }
 
 void ep0_loop(int fd) {
