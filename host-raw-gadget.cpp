@@ -21,7 +21,7 @@ struct raw_gadget_device host_device_desc;
 /*----------------------------------------------------------------------*/
 
 int usb_raw_open() {
-	int fd = open("/dev/raw-gadget", O_RDWR);
+	int fd = open("/dev/raw-gadget", O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		perror("open() /dev/raw-gadget");
 		exit(EXIT_FAILURE);
@@ -205,6 +205,80 @@ void usb_raw_ep_set_halt(int fd, int ep) {
 		perror("ioctl(USB_RAW_IOCTL_EP_SET_HALT)");
 		exit(EXIT_FAILURE);
 	}
+}
+
+/*----------------------------------------------------------------------*/
+
+static int try_ioctl(int fd, unsigned long req, void *arg) {
+	int rv = ioctl(fd, req, arg);
+	return rv < 0 ? -errno : rv;
+}
+
+int usb_raw_open_try(void) {
+	int fd = open("/dev/raw-gadget", O_RDWR | O_CLOEXEC);
+	return fd < 0 ? -errno : fd;
+}
+
+int usb_raw_init_try(int fd, enum usb_device_speed speed,
+			const char *driver, const char *device) {
+	struct usb_raw_init arg;
+	memset(&arg, 0, sizeof(arg));
+	strncpy((char *)&arg.driver_name[0], driver, UDC_NAME_LENGTH_MAX - 1);
+	strncpy((char *)&arg.device_name[0], device, UDC_NAME_LENGTH_MAX - 1);
+	arg.speed = speed;
+	return try_ioctl(fd, USB_RAW_IOCTL_INIT, &arg);
+}
+
+int usb_raw_run_try(int fd) {
+	return try_ioctl(fd, USB_RAW_IOCTL_RUN, 0);
+}
+
+int usb_raw_event_fetch_try(int fd, struct usb_raw_event *event) {
+	return try_ioctl(fd, USB_RAW_IOCTL_EVENT_FETCH, event);
+}
+
+int usb_raw_ep0_read_try(int fd, struct usb_raw_ep_io *io) {
+	return try_ioctl(fd, USB_RAW_IOCTL_EP0_READ, io);
+}
+
+int usb_raw_ep0_write_try(int fd, struct usb_raw_ep_io *io) {
+	return try_ioctl(fd, USB_RAW_IOCTL_EP0_WRITE, io);
+}
+
+int usb_raw_ep0_stall_try(int fd) {
+	return try_ioctl(fd, USB_RAW_IOCTL_EP0_STALL, 0);
+}
+
+int usb_raw_ep_enable_try(int fd, struct usb_endpoint_descriptor *desc) {
+	return try_ioctl(fd, USB_RAW_IOCTL_EP_ENABLE, desc);
+}
+
+int usb_raw_ep_disable_try(int fd, uint32_t num) {
+	return try_ioctl(fd, USB_RAW_IOCTL_EP_DISABLE, (void *)(uintptr_t)num);
+}
+
+int usb_raw_ep_read_try(int fd, struct usb_raw_ep_io *io) {
+	return try_ioctl(fd, USB_RAW_IOCTL_EP_READ, io);
+}
+
+int usb_raw_ep_write_try(int fd, struct usb_raw_ep_io *io) {
+	return try_ioctl(fd, USB_RAW_IOCTL_EP_WRITE, io);
+}
+
+int usb_raw_configure_try(int fd) {
+	return try_ioctl(fd, USB_RAW_IOCTL_CONFIGURE, 0);
+}
+
+int usb_raw_eps_info_try(int fd, struct usb_raw_eps_info *info) {
+	return try_ioctl(fd, USB_RAW_IOCTL_EPS_INFO, info);
+}
+
+int usb_raw_ep_set_halt_try(int fd, int ep) {
+	return try_ioctl(fd, USB_RAW_IOCTL_EP_SET_HALT, (void *)(uintptr_t)ep);
+}
+
+int usb_raw_ep_clear_halt_try(int fd, int ep) {
+	return try_ioctl(fd, USB_RAW_IOCTL_EP_CLEAR_HALT, (void *)(uintptr_t)ep);
 }
 
 /*----------------------------------------------------------------------*/

@@ -1,3 +1,6 @@
+#ifndef USBPROXY_MISC_H
+#define USBPROXY_MISC_H
+
 #include <assert.h>
 #include <atomic>
 #include <cstring>
@@ -33,9 +36,24 @@ extern bool adb_ack_accel;
 extern int musb_out_read_packets;
 extern bool gadget_is_musb;
 
+// CDC-ACM console over the gadget port (console-acm.cpp, gadget-idle.cpp).
+extern bool usb_console;
+extern bool usb_console_idle;
+extern int usb_console_idle_delay_ms;
+extern int usb_console_min_off_ms;
+extern std::string usb_console_shell;
+// UDC the gadget binds to (--driver / --device), for the idle gadget.
+extern const char *gadget_driver;
+extern const char *gadget_device;
+
+// Installed for SIGUSR1: interrupts a blocking raw-gadget ioctl, nothing else.
+void noop_signal_handler(int);
+
 // Seconds since boot (CLOCK_MONOTONIC), the same clock dmesg stamps with, so
 // milestone log lines can be lined up with the kernel's USB events.
 double uptime_s(void);
 
 std::string hexToAscii(std::string input);
 int hexToDecimal(int input);
+
+#endif /* USBPROXY_MISC_H */

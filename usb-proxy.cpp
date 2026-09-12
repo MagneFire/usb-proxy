@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <atomic>
 #include <cstring>
 #include <unordered_map>
@@ -10,6 +11,9 @@
 #include "proxy.h"
 #include "misc.h"
 #include "power-policy.h"
+#include "console-acm.h"
+#include "console-shell.h"
+#include "gadget-idle.h"
 
 int verbose_level = 0;
 bool please_stop_ep0 = false;
@@ -44,6 +48,16 @@ bool adb_ack_accel = false;
 int musb_out_read_packets = 1;
 bool gadget_is_musb = false;
 enum usb_device_speed device_speed = USB_SPEED_HIGH;
+// CDC-ACM console over the gadget port. Off by default: it changes what the
+// host sees (two extra interfaces on the proxied device's configuration), so
+// it is a per-deployment choice, not a proxying default.
+bool usb_console = false;
+bool usb_console_idle = false;
+int usb_console_idle_delay_ms = 2000;
+int usb_console_min_off_ms = 1000;
+std::string usb_console_shell = "/bin/sh -l";
+const char *gadget_driver = "dummy_udc";
+const char *gadget_device = "dummy_udc.0";
 
 // Print the transform summary for a single injection rule.
 // Returns true if the rule references a Lua script_file.
@@ -153,6 +167,16 @@ void usage() {
 		power_idle_ms);
 	printf("\t--settle_ms N: a newly appeared device must survive N ms before the gadget\n");
 	printf("\t               attaches (skips transient re-enumerations; default 0 = at once)\n");
+	printf("\t--usb_console: add a CDC-ACM serial console (a root shell on a pty) to the\n");
+	printf("\t               gadget, next to the proxied device's interfaces; needs\n");
+	printf("\t               --auto_remap_endpoints and 3 free UDC endpoints\n");
+	printf("\t--usb_console_idle: while no device is attached, present a console-only gadget\n");
+	printf("\t--usb_console_idle_delay_ms N: how long the bus must be empty before the idle\n");
+	printf("\t               console attaches (default %d)\n", usb_console_idle_delay_ms);
+	printf("\t--usb_console_shell CMD: what runs on the console pty (default `%s`)\n",
+		usb_console_shell.c_str());
+	printf("\t--min_off_ms N: minimum time the gadget stays detached between the idle console\n");
+	printf("\t               and the proxied device (default %d)\n", usb_console_min_off_ms);
 	printf("* If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.\n");
 	printf("* If `driver` not specified, `usb-proxy` will use `dummy_udc` as default driver.\n");
 	printf("* If both `vendor_id` and `product_id` not specified, `usb-proxy` will connect\n");
@@ -185,6 +209,8 @@ void handle_signal(int signum) {
 // Wrapper for UDC endpoint info, allowing future extension with additional state.
 struct EndpointCandidate {
 	struct usb_raw_ep_info info;
+	// Taken by the CDC-ACM console; never handed to a proxied endpoint.
+	bool reserved = false;
 };
 
 static bool candidate_supports_endpoint(const EndpointCandidate &candidate,
@@ -244,7 +270,7 @@ static int find_candidate_index(const std::vector<EndpointCandidate> &candidates
 				const struct usb_endpoint_descriptor &endpoint)
 {
 	for (size_t i = 0; i < candidates.size(); i++) {
-		if (candidate_used[i])
+		if (candidate_used[i] || candidates[i].reserved)
 			continue;
 		if (!candidate_supports_endpoint(candidates[i], endpoint))
 			continue;
@@ -319,10 +345,24 @@ static int remap_config_endpoints(struct raw_gadget_config *config,
 	return 0;
 }
 
+static int remap_all_configs(const std::vector<EndpointCandidate> &candidates)
+{
+	for (int i = 0; i < host_device_desc.device.bNumConfigurations; i++) {
+		if (remap_config_endpoints(&host_device_desc.configs[i], candidates) < 0)
+			return -1;
+	}
+	return 0;
+}
+
 static int remap_host_endpoints_if_needed(int fd)
 {
-	if (!auto_remap_endpoints)
+	if (!auto_remap_endpoints) {
+		if (usb_console)
+			printf("console: --usb_console needs --auto_remap_endpoints "
+			       "(the console takes UDC endpoints a proxied device could "
+			       "address by number); console disabled\n");
 		return 0;
+	}
 
 	struct usb_raw_eps_info eps_info;
 	memset(&eps_info, 0, sizeof(eps_info));
@@ -340,12 +380,25 @@ static int remap_host_endpoints_if_needed(int fd)
 		candidates.push_back(candidate);
 	}
 
-	for (int i = 0; i < host_device_desc.device.bNumConfigurations; i++) {
-		if (remap_config_endpoints(&host_device_desc.configs[i], candidates) < 0)
-			return -1;
+	// The console takes its endpoints first, from the tail of the pool, so
+	// the proxied device keeps the low numbers. If the device then does not
+	// fit, the console gives way: proxying is the job, the console a bonus.
+	if (usb_console) {
+		std::vector<bool> reserved(num, false);
+		if (acm_reserve_endpoints(eps_info, num, reserved)) {
+			for (int i = 0; i < num; i++)
+				candidates[i].reserved = reserved[i];
+			if (remap_all_configs(candidates) == 0)
+				return 0;
+			printf("console: device endpoints do not fit next to the console; "
+			       "console disabled for this device\n");
+			acm_unreserve();
+			for (int i = 0; i < num; i++)
+				candidates[i].reserved = false;
+		}
 	}
 
-	return 0;
+	return remap_all_configs(candidates);
 }
 
 int setup_host_usb_desc() {
@@ -497,6 +550,10 @@ int main(int argc, char **argv)
 	action.sa_handler = handle_signal;
 	sigaction(SIGTERM, &action, NULL);
 	sigaction(SIGINT, &action, NULL);
+	// SIGUSR1 interrupts blocking raw-gadget ioctls in the endpoint, console
+	// and idle-gadget threads. Installed here, before any of them exists,
+	// so a signal sent to an early thread cannot hit the default action.
+	signal(SIGUSR1, noop_signal_handler);
 
 	int opt, lopt, loidx;
 	const char *optstring = "hv";
@@ -519,6 +576,11 @@ int main(int argc, char **argv)
 		{"power_hook", required_argument, &lopt, 16},
 		{"power_idle_ms", required_argument, &lopt, 17},
 		{"settle_ms", required_argument, &lopt, 18},
+		{"usb_console", no_argument, &lopt, 19},
+		{"usb_console_idle", no_argument, &lopt, 20},
+		{"usb_console_idle_delay_ms", required_argument, &lopt, 21},
+		{"usb_console_shell", required_argument, &lopt, 22},
+		{"min_off_ms", required_argument, &lopt, 23},
 		{0, 0, 0, 0}
 	};
 	while ((opt = getopt_long(argc, argv, optstring, long_options, &loidx)) != -1) {
@@ -611,6 +673,25 @@ int main(int argc, char **argv)
 			if (device_settle_ms > 0)
 				printf("Device settle set to %d ms\n", device_settle_ms);
 			break;
+		case 19:
+			usb_console = true;
+			break;
+		case 20:
+			usb_console_idle = true;
+			break;
+		case 21:
+			usb_console_idle_delay_ms = std::stoi(optarg);
+			if (usb_console_idle_delay_ms < 0)
+				usb_console_idle_delay_ms = 0;
+			break;
+		case 22:
+			usb_console_shell = optarg;
+			break;
+		case 23:
+			usb_console_min_off_ms = std::stoi(optarg);
+			if (usb_console_min_off_ms < 0)
+				usb_console_min_off_ms = 0;
+			break;
 
 		default:
 			usage();
@@ -620,6 +701,8 @@ int main(int argc, char **argv)
 	// The musb-hdrc gadget controller mishandles OUT requests whose buffer is
 	// larger than one packet, so OUT reads are clamped to wMaxPacketSize for it.
 	gadget_is_musb = (strstr(driver, "musb") != NULL);
+	gadget_driver = driver;
+	gadget_device = device;
 	printf("Device is: %s\n", device);
 	printf("Driver is: %s\n", driver);
 	printf("vendor_id is: %d\n", vendor_id);
@@ -712,15 +795,44 @@ int main(int argc, char **argv)
 			int v = customized_config["power_idle_ms"].asInt();
 			power_idle_ms = v < POWER_IDLE_MS_MIN ? POWER_IDLE_MS_MIN : v;
 		}
+		if (customized_config.get("usb_console", false).asBool())
+			usb_console = true;
+		if (customized_config.get("usb_console_idle", false).asBool())
+			usb_console_idle = true;
+		if (customized_config.isMember("usb_console_idle_delay_ms")) {
+			int v = customized_config["usb_console_idle_delay_ms"].asInt();
+			usb_console_idle_delay_ms = v < 0 ? 0 : v;
+		}
+		if (customized_config.isMember("usb_console_shell"))
+			usb_console_shell = customized_config["usb_console_shell"].asString();
+		if (customized_config.isMember("min_off_ms")) {
+			int v = customized_config["min_off_ms"].asInt();
+			usb_console_min_off_ms = v < 0 ? 0 : v;
+		}
 	}
+	if (usb_console)
+		printf("usb_console enabled (CDC-ACM shell `%s`%s, idle delay %d ms, min off %d ms)\n",
+			usb_console_shell.c_str(),
+			usb_console_idle ? ", idle console" : "",
+			usb_console_idle_delay_ms, usb_console_min_off_ms);
 
 	// After option and config parsing, so both sources are honoured.
 	power_policy_start();
+
+	// The console shell exists for the life of the process, so the idle
+	// console has a prompt the moment it enumerates.
+	if (usb_console)
+		shell_start(usb_console_shell);
 
 	// connect_device() itself waits for a device to appear; a non-zero return
 	// is a failed attempt on one that is there (or vanished mid-attempt), so
 	// retry quickly rather than adding a second to every enumeration.
 	while (connect_device(vendor_id, product_id)) {
+		if (please_stop_ep0) {
+			idle_gadget_stop();
+			shell_stop();
+			return 0;
+		}
 		usleep(200 * 1000);
 	}
 	printf("[%.3f] Device opened successfully\n", uptime_s());
@@ -757,11 +869,33 @@ int main(int argc, char **argv)
 	setup_host_usb_desc();
 	printf("Setup USB config successfully\n");
 
+	// If the idle console was on the bus a moment ago, give the host time to
+	// see the disconnect before a different gadget appears on the same port.
+	idle_gadget_wait_min_off(usb_console_min_off_ms);
+
 	int fd = usb_raw_open();
 	// Always use USB_SPEED_HIGH for the gadget; some UDCs (e.g., musb-hdrc)
 	// reject lower speeds. We compensate by adjusting bInterval below.
-	usb_raw_init(fd, USB_SPEED_HIGH, driver, device);
-	usb_raw_run(fd);
+	// The UDC may still be unbinding from the idle gadget: retry briefly on
+	// EBUSY before giving up (the exiting wrapper would take the process down
+	// and inittab would respawn it, which also works, only slower).
+	int rv_init = usb_raw_init_try(fd, USB_SPEED_HIGH, driver, device);
+	if (rv_init < 0) {
+		errno = -rv_init;
+		perror("ioctl(USB_RAW_IOCTL_INIT)");
+		exit(EXIT_FAILURE);
+	}
+	int rv_run = -EBUSY;
+	for (int attempt = 0; attempt < 40 && rv_run == -EBUSY; attempt++) {
+		rv_run = usb_raw_run_try(fd);
+		if (rv_run == -EBUSY)
+			usleep(50 * 1000);
+	}
+	if (rv_run < 0) {
+		errno = -rv_run;
+		perror("ioctl(USB_RAW_IOCTL_RUN)");
+		exit(EXIT_FAILURE);
+	}
 
 	if (remap_host_endpoints_if_needed(fd) < 0) {
 		close(fd);
@@ -776,6 +910,7 @@ int main(int argc, char **argv)
 	please_stop_hotplug_monitor = true;
 
 	close(fd);
+	shell_stop();
 
 	int bNumConfigurations = device_device_desc.bNumConfigurations;
 	for (int i = 0; i < bNumConfigurations; i++) {

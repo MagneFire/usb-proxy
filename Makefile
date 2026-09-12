@@ -46,12 +46,15 @@ endif
 
 endif # ifneq clean
 
-LDFLAG=-lusb-1.0 -pthread -ljsoncpp $(LUA_LIBS)
+LDFLAG=-lusb-1.0 -pthread -ljsoncpp -lutil $(LUA_LIBS)
 
 .PHONY: all clean
 
-usb-proxy: usb-proxy.o host-raw-gadget.o device-libusb.o proxy.o misc.o power-policy.o
-	g++ usb-proxy.o host-raw-gadget.o device-libusb.o proxy.o misc.o power-policy.o $(LDFLAG) -o usb-proxy
+OBJS=usb-proxy.o host-raw-gadget.o device-libusb.o proxy.o misc.o power-policy.o \
+     console-acm.o console-shell.o gadget-idle.o
+
+usb-proxy: $(OBJS)
+	g++ $(OBJS) $(LDFLAG) -o usb-proxy
 
 # These files need $(LUA_CFLAGS) so HAVE_LUA is defined consistently across them
 proxy.o: proxy.cpp

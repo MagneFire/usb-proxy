@@ -8,6 +8,7 @@
 
 #include "device-libusb.h"
 #include "proxy.h"
+#include "gadget-idle.h"
 
 libusb_device 			**devs;
 libusb_device_handle 		*dev_handle;
@@ -126,6 +127,11 @@ int connect_device(int vendor_id, int product_id) {
 
 	libusb_device *found = NULL;
 	bool announced = false;
+	// Idle console: attach a console-only gadget once the bus has been empty
+	// for usb_console_idle_delay_ms. The delay is what keeps it from flapping
+	// through the watch's transient enumerations on a cradle attach (a device
+	// that lives 2.2 s, one that lives 0.33 s, then the real one).
+	auto idle_since = std::chrono::steady_clock::now();
 
 	// Wait here for a device rather than exiting and being respawned by a
 	// polling launcher. Measured on the appliance: a launcher cycle of
@@ -175,9 +181,27 @@ int connect_device(int vendor_id, int product_id) {
 				announced = true;
 			}
 			libusb_free_device_list(devs, 1);
+			if (please_stop_ep0)
+				return 1;
+			if (usb_console && usb_console_idle && !idle_gadget_attached()) {
+				auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - idle_since).count();
+				if (idle_ms >= usb_console_idle_delay_ms) {
+					idle_gadget_wait_min_off(usb_console_min_off_ms);
+					if (!idle_gadget_start(gadget_driver, gadget_device)) {
+						// Failed attach: do not hammer the UDC, try
+						// again after another idle period.
+						idle_since = std::chrono::steady_clock::now();
+					}
+				}
+			}
 			usleep(DEVICE_POLL_MS * 1000);
 		}
 	}
+
+	// A device is there: the UDC is needed for it. Detach the idle console
+	// now so the min-off window overlaps the settle/open time below.
+	idle_gadget_stop();
 
 	snprintf(device_node_path, sizeof(device_node_path),
 		"/dev/bus/usb/%03d/%03d",

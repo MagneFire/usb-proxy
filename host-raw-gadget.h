@@ -1,3 +1,6 @@
+#ifndef HOST_RAW_GADGET_H
+#define HOST_RAW_GADGET_H
+
 #include <atomic>
 #include <pthread.h>
 #include <mutex>
@@ -188,6 +191,28 @@ int usb_raw_eps_info(int fd, struct usb_raw_eps_info *info);
 void usb_raw_ep0_stall(int fd);
 void usb_raw_ep_set_halt(int fd, int ep);
 
+// Non-exiting variants for the in-process console (console-acm.cpp,
+// gadget-idle.cpp), which must fail open: they return the ioctl result and
+// -errno on error instead of exit()ing like the wrappers above.
+int usb_raw_open_try(void);
+int usb_raw_init_try(int fd, enum usb_device_speed speed,
+			const char *driver, const char *device);
+int usb_raw_run_try(int fd);
+int usb_raw_event_fetch_try(int fd, struct usb_raw_event *event);
+int usb_raw_ep0_read_try(int fd, struct usb_raw_ep_io *io);
+int usb_raw_ep0_write_try(int fd, struct usb_raw_ep_io *io);
+int usb_raw_ep0_stall_try(int fd);
+int usb_raw_ep_enable_try(int fd, struct usb_endpoint_descriptor *desc);
+int usb_raw_ep_disable_try(int fd, uint32_t num);
+int usb_raw_ep_read_try(int fd, struct usb_raw_ep_io *io);
+int usb_raw_ep_write_try(int fd, struct usb_raw_ep_io *io);
+int usb_raw_configure_try(int fd);
+int usb_raw_eps_info_try(int fd, struct usb_raw_eps_info *info);
+int usb_raw_ep_set_halt_try(int fd, int ep);
+int usb_raw_ep_clear_halt_try(int fd, int ep);
+
 void log_control_request(struct usb_ctrlrequest *ctrl);
 void log_event(struct usb_raw_event *event);
 void print_eps_info(int fd);
+
+#endif /* HOST_RAW_GADGET_H */
