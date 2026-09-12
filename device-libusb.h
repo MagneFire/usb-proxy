@@ -52,6 +52,11 @@ extern pthread_t hotplug_monitor_thread;
 extern std::atomic<bool> please_stop_hotplug_monitor;
 
 int connect_device(int vendorId, int productId);
+// Persistent gadget (bridge.h): choose the interface to bridge, and let the
+// device go again once it has left the bus.
+int pick_bridge_interface(int *slot, uint8_t *in_addr, uint8_t *out_addr,
+			  int *config_value);
+void disconnect_device(int claimed_interface);
 void reset_device();
 void set_configuration(int configuration);
 void claim_interface(int interface);

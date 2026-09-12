@@ -36,6 +36,16 @@ extern int musb_out_read_packets;
 #define MUSB_OUT_READ_PACKETS_MAX 64
 extern bool gadget_is_musb;
 
+// Persistent gadget (gadget-fixed.cpp, bridge.cpp): one fixed gadget for the
+// life of the process, the proxied device's bulk endpoints bridged onto it.
+// It carries the CDC-ACM console (console-acm.cpp) whose pty runs
+// usb_console_shell.
+extern bool persistent_gadget;
+extern int gadget_vendor_id;
+extern int gadget_product_id;
+extern std::string gadget_serial;
+extern std::string usb_console_shell;
+
 // Installed for SIGUSR1: interrupts a blocking raw-gadget ioctl, nothing else.
 void noop_signal_handler(int);
 

@@ -12,6 +12,10 @@
 #include "proxy.h"
 #include "misc.h"
 #include "power-policy.h"
+#include "console-acm.h"
+#include "console-shell.h"
+#include "gadget-fixed.h"
+#include "bridge.h"
 
 int verbose_level = 0;
 bool please_stop_ep0 = false;
@@ -39,6 +43,14 @@ bool adb_ack_accel = false;
 int musb_out_read_packets = 1;
 bool gadget_is_musb = false;
 enum usb_device_speed device_speed = USB_SPEED_HIGH;
+// Persistent gadget (gadget-fixed.cpp / bridge.cpp). Off by default: the
+// host then sees usb-proxy's fixed identity, not the proxied device's.
+bool persistent_gadget = false;
+int gadget_vendor_id = 0x1d6b;
+int gadget_product_id = 0x0104;
+std::string gadget_serial = "USBPROXY01";
+// What runs on the pty behind the fixed gadget's CDC-ACM console.
+std::string usb_console_shell = "/bin/sh -l";
 
 // Knob parsing helpers: the same clamp for the CLI and the config file, and a
 // "set to" line only when a value differs from its default.
@@ -177,6 +189,16 @@ void usage() {
 		power_idle_ms);
 	printf("\t--settle_ms N: a newly appeared device must survive N ms before the gadget\n");
 	printf("\t               attaches (skips transient re-enumerations; default 0 = at once)\n");
+	printf("\t--persistent_gadget: present ONE fixed gadget for the life of the process (a CDC-ACM\n");
+	printf("\t               console + an adb + a fastboot interface, usb-proxy's own identity) and\n");
+	printf("\t               bridge the proxied device's bulk endpoints onto it: the host never\n");
+	printf("\t               re-enumerates when the device appears, leaves or switches adb<->fastboot.\n");
+	printf("\t               Devices that are not adb/fastboot are ignored while they are attached.\n");
+	printf("\t--gadget_vendor_id HEX / --gadget_product_id HEX / --gadget_serial STR: the fixed\n");
+	printf("\t               gadget's identity (default %04x:%04x, %s)\n",
+		gadget_vendor_id, gadget_product_id, gadget_serial.c_str());
+	printf("\t--usb_console_shell CMD: what runs on the console pty (default `%s`)\n",
+		usb_console_shell.c_str());
 	printf("* If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.\n");
 	printf("* If `driver` not specified, `usb-proxy` will use `dummy_udc` as default driver.\n");
 	printf("* If both `vendor_id` and `product_id` not specified, `usb-proxy` will connect\n");
@@ -209,6 +231,8 @@ void handle_signal(int signum) {
 // Wrapper for UDC endpoint info, allowing future extension with additional state.
 struct EndpointCandidate {
 	struct usb_raw_ep_info info;
+	// Taken by the CDC-ACM console; never handed to a bridge endpoint.
+	bool reserved = false;
 };
 
 static bool candidate_supports_endpoint(const EndpointCandidate &candidate,
@@ -268,7 +292,7 @@ static int find_candidate_index(const std::vector<EndpointCandidate> &candidates
 				const struct usb_endpoint_descriptor &endpoint)
 {
 	for (size_t i = 0; i < candidates.size(); i++) {
-		if (candidate_used[i])
+		if (candidate_used[i] || candidates[i].reserved)
 			continue;
 		if (!candidate_supports_endpoint(candidates[i], endpoint))
 			continue;
@@ -343,7 +367,16 @@ static int remap_config_endpoints(struct raw_gadget_config *config,
 	return 0;
 }
 
-static int remap_host_endpoints_if_needed(int fd)
+static int remap_all_configs(const std::vector<EndpointCandidate> &candidates)
+{
+	for (int i = 0; i < host_device_desc.device.bNumConfigurations; i++) {
+		if (remap_config_endpoints(&host_device_desc.configs[i], candidates) < 0)
+			return -1;
+	}
+	return 0;
+}
+
+int remap_host_endpoints_if_needed(int fd)
 {
 	if (!auto_remap_endpoints)
 		return 0;
@@ -364,12 +397,26 @@ static int remap_host_endpoints_if_needed(int fd)
 		candidates.push_back(candidate);
 	}
 
-	for (int i = 0; i < host_device_desc.device.bNumConfigurations; i++) {
-		if (remap_config_endpoints(&host_device_desc.configs[i], candidates) < 0)
-			return -1;
+	// Persistent gadget: the console takes its endpoints first, from the
+	// tail of the pool, so the bridge interfaces keep the low numbers. If
+	// they then do not fit, the console gives way: proxying is the job, the
+	// console a bonus.
+	if (persistent_gadget) {
+		std::vector<bool> reserved(num, false);
+		if (acm_reserve_endpoints(eps_info, num, reserved)) {
+			for (int i = 0; i < num; i++)
+				candidates[i].reserved = reserved[i];
+			if (remap_all_configs(candidates) == 0)
+				return 0;
+			printf("console: the bridge endpoints do not fit next to the console; "
+			       "console disabled\n");
+			acm_unreserve();
+			for (int i = 0; i < num; i++)
+				candidates[i].reserved = false;
+		}
 	}
 
-	return 0;
+	return remap_all_configs(candidates);
 }
 
 int setup_host_usb_desc() {
@@ -546,6 +593,11 @@ int main(int argc, char **argv)
 		{"power_hook", required_argument, &lopt, 15},
 		{"power_idle_ms", required_argument, &lopt, 16},
 		{"settle_ms", required_argument, &lopt, 17},
+		{"persistent_gadget", no_argument, &lopt, 18},
+		{"gadget_vendor_id", required_argument, &lopt, 19},
+		{"gadget_product_id", required_argument, &lopt, 20},
+		{"gadget_serial", required_argument, &lopt, 21},
+		{"usb_console_shell", required_argument, &lopt, 22},
 		{0, 0, 0, 0}
 	};
 	while ((opt = getopt_long(argc, argv, optstring, long_options, &loidx)) != -1) {
@@ -620,6 +672,22 @@ int main(int argc, char **argv)
 		case 17:
 			set_int_knob("settle_ms", device_settle_ms, std::stoi(optarg), 0, INT_MAX);
 			break;
+		case 18:
+			persistent_gadget = true;
+			printf("persistent_gadget set to true\n");
+			break;
+		case 19:
+			gadget_vendor_id = std::stoul(optarg, nullptr, 16) & 0xffff;
+			break;
+		case 20:
+			gadget_product_id = std::stoul(optarg, nullptr, 16) & 0xffff;
+			break;
+		case 21:
+			gadget_serial = optarg;
+			break;
+		case 22:
+			usb_console_shell = optarg;
+			break;
 
 		default:
 			usage();
@@ -693,10 +761,117 @@ int main(int argc, char **argv)
 			power_hook = customized_config["power_hook"].asString();
 		cfg_int(customized_config, "power_idle_ms", power_idle_ms,
 			POWER_IDLE_MS_MIN, INT_MAX);
+		cfg_bool(customized_config, "persistent_gadget", persistent_gadget);
+		if (customized_config.isMember("gadget_vendor_id"))
+			gadget_vendor_id = std::stoul(customized_config["gadget_vendor_id"].asString(),
+						      nullptr, 16) & 0xffff;
+		if (customized_config.isMember("gadget_product_id"))
+			gadget_product_id = std::stoul(customized_config["gadget_product_id"].asString(),
+						       nullptr, 16) & 0xffff;
+		if (customized_config.isMember("gadget_serial"))
+			gadget_serial = customized_config["gadget_serial"].asString();
+		if (customized_config.isMember("usb_console_shell"))
+			usb_console_shell = customized_config["usb_console_shell"].asString();
+	}
+	if (persistent_gadget) {
+		// The fixed gadget's endpoints come from the UDC's own pool, so
+		// remapping is inherent.
+		if (!auto_remap_endpoints)
+			printf("persistent_gadget implies --auto_remap_endpoints\n");
+		auto_remap_endpoints = true;
+		printf("persistent_gadget enabled: fixed gadget %04x:%04x serial %s, console shell `%s`;\n"
+		       "the host sees this identity, not the proxied device's, and is never re-enumerated\n"
+		       "on device changes\n",
+		       gadget_vendor_id, gadget_product_id, gadget_serial.c_str(),
+		       usb_console_shell.c_str());
 	}
 
 	// After option and config parsing, so both sources are honoured.
 	power_policy_start();
+
+	// The console shell exists for the life of the process, so the fixed
+	// gadget has a prompt the moment the host opens the port.
+	if (persistent_gadget)
+		shell_start(usb_console_shell);
+
+	// Persistent gadget: attach the fixed gadget now and run the device
+	// manager. Devices that fit the adb/fastboot template are bridged onto
+	// it, for as long as they last, without the host ever seeing a change;
+	// anything else is ignored while it is on the bus. Only when the fixed
+	// gadget cannot attach at all do we drop through to the transparent path.
+	if (persistent_gadget) {
+		bridge_setup_desc();
+		if (!fixed_gadget_start(driver, device)) {
+			printf("persistent_gadget: cannot attach the fixed gadget; "
+			       "falling back to the transparent mirror (no console)\n");
+			persistent_gadget = false;
+			shell_stop();
+		} else {
+			for (;;) {
+				while (connect_device(vendor_id, product_id)) {
+					if (please_stop_ep0)
+						break;
+					usleep(200 * 1000);
+				}
+				if (please_stop_ep0) {
+					fixed_gadget_stop();
+					shell_stop();
+					please_stop_hotplug_monitor = true;
+					if (hotplug_monitor_thread)
+						pthread_join(hotplug_monitor_thread, NULL);
+					return 0;
+				}
+				printf("[%.3f] Device opened successfully\n", uptime_s());
+				power_note_activity(1);
+				// Any loss flagged from here on is this device's.
+				bridge_clear_device_lost();
+
+				int slot = -1, config_value = 0;
+				uint8_t dev_in = 0, dev_out = 0;
+				int ifnum = pick_bridge_interface(&slot, &dev_in, &dev_out,
+								  &config_value);
+				if (ifnum < 0) {
+					// Not adb/fastboot: e.g. the mass-storage instance the
+					// watch presents while booting. Never rebuild the gadget
+					// for it (that would re-enumerate the host and orphan
+					// the console for a transient); hold it, ignored, until
+					// it leaves the bus, then look again.
+					printf("[%.3f] device does not fit the adb/fastboot template "
+					       "(no ff/42/01 or ff/42/03 bulk interface); ignoring it "
+					       "until it leaves the bus\n", uptime_s());
+					bridge_wait_device_lost(-1);
+					disconnect_device(-1);
+					continue;
+				}
+
+				set_configuration(config_value);
+				claim_interface(ifnum);
+				if (bridge_device_lost_pending()) {
+					printf("[%.3f] device vanished while being claimed\n", uptime_s());
+					disconnect_device(ifnum);
+					continue;
+				}
+				if (!bridge_bind(slot, dev_in, dev_out)) {
+					disconnect_device(ifnum);
+					usleep(200 * 1000);
+					continue;
+				}
+				printf("[%.3f] bound interface %d of the device to the %s slot\n",
+				       uptime_s(), ifnum, slot == BRIDGE_SLOT_ADB ? "adb" : "fastboot");
+
+				// The host's CNXN, if its transport was restarted, arrives
+				// within milliseconds of the bind; give it half a second,
+				// then replay the previous one if the transport is stale.
+				if (slot == BRIDGE_SLOT_ADB && !bridge_wait_device_lost(500))
+					bridge_replay_cnxn_if_needed();
+
+				bridge_wait_device_lost(-1);
+				bridge_unbind();
+				disconnect_device(ifnum);
+				printf("[%.3f] device released; waiting for the next one\n", uptime_s());
+			}
+		}
+	}
 
 	// connect_device() itself waits for a device to appear; a non-zero return
 	// is a failed attempt on one that is there (or vanished mid-attempt), so

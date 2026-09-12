@@ -8,6 +8,7 @@
 
 #include "device-libusb.h"
 #include "proxy.h"
+#include "bridge.h"
 
 libusb_device 			**devs;
 libusb_device_handle 		*dev_handle;
@@ -29,7 +30,11 @@ std::atomic<bool> please_stop_hotplug_monitor{false};
 // devtmpfs node of the opened device (/dev/bus/usb/BBB/DDD). The kernel removes
 // it the moment the device leaves the bus, and a device that comes back gets a
 // fresh address, so its absence is an unambiguous, bus-traffic-free "gone".
+// node_watch gates the liveness check: set once a device is open, cleared
+// before the path is reused, so the monitor thread never reads a half-written
+// path and reports a given loss once.
 static char device_node_path[32];
+static std::atomic<bool> node_watch(false);
 
 int hotplug_callback(struct libusb_context *ctx __attribute__((unused)),
 			struct libusb_device *dev __attribute__((unused)),
@@ -39,8 +44,8 @@ int hotplug_callback(struct libusb_context *ctx __attribute__((unused)),
 	// blocked in USB_RAW_IOCTL_EVENT_FETCH is not interrupted unless the signal
 	// happens to land on it, and even then main() ends in a pthread_join on
 	// this never-ending thread. Exit the way the endpoint threads do instead.
-	printf("Hotplug event: device disconnected, exiting usb-proxy\n");
-	drain_in_queues_and_exit();
+	printf("Hotplug event: device disconnected\n");
+	device_lost("hotplug");
 	return 0;
 }
 
@@ -58,10 +63,11 @@ void *hotplug_monitor(void *arg __attribute__((unused))) {
 		// with the host idle and no endpoint thread running there may be
 		// no transfer to fail with NO_DEVICE, and the proxy would otherwise
 		// sit on a dead handle with the gadget still attached.
-		if (device_node_path[0] && access(device_node_path, F_OK) != 0 &&
+		if (node_watch && access(device_node_path, F_OK) != 0 &&
 		    errno == ENOENT) {
-			printf("Device node %s gone, exiting usb-proxy\n", device_node_path);
-			drain_in_queues_and_exit();
+			printf("Device node %s gone\n", device_node_path);
+			node_watch = false;
+			device_lost("device node");
 		}
 	}
 	return nullptr;
@@ -98,6 +104,7 @@ int device_settle_ms = 0;
 // Undo a partial connect so the caller can simply retry: close the handle and
 // drop the config descriptors get_descriptor() allocated for this attempt.
 static void drop_device_attempt(void) {
+	node_watch = false;
 	if (dev_handle) {
 		libusb_close(dev_handle);
 		dev_handle = NULL;
@@ -279,6 +286,8 @@ int connect_device(int vendor_id, int product_id) {
 		return result;
 	}
 
+	node_watch = true;
+
 	if (callback_handle == -1) {
 		result = libusb_hotplug_register_callback(context,
 			(libusb_hotplug_event) (LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT),
@@ -305,14 +314,63 @@ void reset_device() {
 	}
 }
 
-// The configuration/interface helpers run on the ep0 thread before any
-// endpoint thread exists, so a device that vanished underneath them has
-// nobody else to notice. Same exit as the endpoint threads.
-static void device_gone_exit(const char *where) {
-	printf("%s: device gone, exiting usb-proxy\n", where);
-	drain_in_queues_and_exit();
+// Persistent gadget: find the interface to bridge in the device's active
+// configuration -- the first vendor-specific 0xff/0x42 interface with protocol
+// 0x01 (adb, also TWRP's) or 0x03 (fastboot) and exactly two bulk endpoints.
+// Fills the slot and the device's endpoint addresses; returns the interface
+// number, or -1 when the device does not fit the fixed template.
+int pick_bridge_interface(int *slot, uint8_t *in_addr, uint8_t *out_addr,
+			  int *config_value) {
+	int active = -1;
+	if (libusb_get_configuration(dev_handle, &active) != LIBUSB_SUCCESS)
+		return -1;
+	for (int i = 0; i < device_device_desc.bNumConfigurations; i++) {
+		const struct libusb_config_descriptor *cfg = device_config_desc[i];
+		if (cfg->bConfigurationValue != active)
+			continue;
+		for (int j = 0; j < cfg->bNumInterfaces; j++) {
+			if (cfg->interface[j].num_altsetting < 1)
+				continue;
+			const struct libusb_interface_descriptor *alt =
+				&cfg->interface[j].altsetting[0];
+			if (alt->bInterfaceClass != 0xff || alt->bInterfaceSubClass != 0x42)
+				continue;
+			int s;
+			if (alt->bInterfaceProtocol == 0x01)
+				s = BRIDGE_SLOT_ADB;
+			else if (alt->bInterfaceProtocol == 0x03)
+				s = BRIDGE_SLOT_FASTBOOT;
+			else
+				continue;
+			if (alt->bNumEndpoints != 2)
+				continue;
+			int in = -1, out = -1;
+			for (int k = 0; k < 2; k++) {
+				const struct libusb_endpoint_descriptor *ep = &alt->endpoint[k];
+				if ((ep->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) !=
+				    LIBUSB_TRANSFER_TYPE_BULK)
+					continue;
+				if (ep->bEndpointAddress & LIBUSB_ENDPOINT_IN)
+					in = ep->bEndpointAddress;
+				else
+					out = ep->bEndpointAddress;
+			}
+			if (in < 0 || out < 0)
+				continue;
+			*slot = s;
+			*in_addr = (uint8_t)in;
+			*out_addr = (uint8_t)out;
+			*config_value = active;
+			return alt->bInterfaceNumber;
+		}
+	}
+	return -1;
 }
 
+// The configuration/interface helpers run on the ep0 thread (or the
+// persistent gadget's device manager) before any endpoint thread exists, so a
+// device that vanished underneath them has nobody else to notice: they report
+// it through device_lost() like the endpoint threads do.
 void set_configuration(int configuration) {
 	// The proxy host's kernel already configured the device at enumeration,
 	// so the host's SET_CONFIGURATION usually asks for the configuration the
@@ -328,7 +386,7 @@ void set_configuration(int configuration) {
 	int active = -1;
 	int result = libusb_get_configuration(dev_handle, &active);
 	if (result == LIBUSB_ERROR_NO_DEVICE)
-		device_gone_exit("set_configuration");
+		device_lost("set_configuration");
 	if (result == LIBUSB_SUCCESS && active == configuration) {
 		printf("Device already in configuration %d, not re-sending SET_CONFIGURATION\n",
 				configuration);
@@ -340,7 +398,7 @@ void set_configuration(int configuration) {
 		fprintf(stderr, "Error setting configuration(%d): %s\n",
 				configuration, libusb_strerror((libusb_error)result));
 		if (result == LIBUSB_ERROR_NO_DEVICE)
-			device_gone_exit("set_configuration");
+			device_lost("set_configuration");
 	}
 }
 
@@ -350,7 +408,7 @@ void claim_interface(int interface) {
 		fprintf(stderr, "Error claiming interface(%d): %s\n",
 				interface, libusb_strerror((libusb_error)result));
 		if (result == LIBUSB_ERROR_NO_DEVICE)
-			device_gone_exit("claim_interface");
+			device_lost("claim_interface");
 	}
 }
 
@@ -368,7 +426,7 @@ void set_interface_alt_setting(int interface, int altsetting) {
 		fprintf(stderr, "Error setting interface altsetting(%d, %d): %s\n",
 				interface, altsetting, libusb_strerror((libusb_error)result));
 		if (result == LIBUSB_ERROR_NO_DEVICE)
-			device_gone_exit("set_interface_alt_setting");
+			device_lost("set_interface_alt_setting");
 	}
 }
 
@@ -782,4 +840,30 @@ int receive_data(uint8_t endpoint, uint8_t attributes, uint16_t maxPacketSize,
 	}
 
 	return result;
+}
+
+// Persistent gadget: let go of the proxied device so the manager can wait for
+// the next one. The forwarding threads are already stopped (bridge_unbind).
+// Async completions still owed for this handle are drained (bounded) before
+// the close: the device is physically gone, so its URBs fail promptly on the
+// event thread. Then the sticky "device gone" state of the async OUT path is
+// reset for the next device.
+void disconnect_device(int claimed_interface) {
+	if (!dev_handle)
+		return;
+	if (claimed_interface >= 0)
+		release_interface(claimed_interface);
+	const auto deadline = std::chrono::steady_clock::now() +
+			      std::chrono::milliseconds(1000);
+	while ((bulk_out_in_flight > 0 || iso_out_in_flight > 0) &&
+	       std::chrono::steady_clock::now() < deadline)
+		usleep(5 * 1000);
+	if (bulk_out_in_flight > 0 || iso_out_in_flight > 0)
+		printf("disconnect: %d bulk / %d iso transfers still in flight at close\n",
+		       bulk_out_in_flight.load(), iso_out_in_flight.load());
+	drop_device_attempt();
+	bulk_out_device_gone = false;
+	bulk_out_in_flight = 0;
+	bulk_out_error_count = 0;
+	iso_out_in_flight = 0;
 }
