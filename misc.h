@@ -1,3 +1,6 @@
+#ifndef USBPROXY_MISC_H
+#define USBPROXY_MISC_H
+
 #include <assert.h>
 #include <atomic>
 #include <cstring>
@@ -33,6 +36,9 @@ extern int musb_out_read_packets;
 #define MUSB_OUT_READ_PACKETS_MAX 64
 extern bool gadget_is_musb;
 
+// Installed for SIGUSR1: interrupts a blocking raw-gadget ioctl, nothing else.
+void noop_signal_handler(int);
+
 // Block every asynchronous signal on the calling thread except SIGINT/SIGTERM
 // (a real shutdown) and the synchronous fault signals; with keep_sigusr1 the
 // thread stays interruptible by pthread_kill(SIGUSR1) as well. For threads
@@ -40,9 +46,15 @@ extern bool gadget_is_musb;
 // with EINTR.
 void block_incidental_signals(bool keep_sigusr1);
 
+// Threads created from one that blocked SIGUSR1 (pthread_create copies the
+// mask) call this so pthread_kill(SIGUSR1) can still pop them out of an ioctl.
+void unblock_sigusr1(void);
+
 // Seconds since boot (CLOCK_MONOTONIC), the same clock dmesg stamps with, so
 // milestone log lines can be lined up with the kernel's USB events.
 double uptime_s(void);
 
 std::string hexToAscii(std::string input);
 int hexToDecimal(int input);
+
+#endif /* USBPROXY_MISC_H */

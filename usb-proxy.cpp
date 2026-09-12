@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <atomic>
 #include <climits>
 #include <cstring>
@@ -520,6 +521,10 @@ int main(int argc, char **argv)
 	action.sa_handler = handle_signal;
 	sigaction(SIGTERM, &action, NULL);
 	sigaction(SIGINT, &action, NULL);
+	// SIGUSR1 interrupts blocking raw-gadget ioctls in the endpoint threads.
+	// Installed here, before any of them exists, so a signal sent to an early
+	// thread cannot hit the default action.
+	signal(SIGUSR1, noop_signal_handler);
 
 	int opt, lopt, loidx;
 	const char *optstring = "hv";
@@ -697,6 +702,8 @@ int main(int argc, char **argv)
 	// is a failed attempt on one that is there (or vanished mid-attempt), so
 	// retry quickly rather than adding a second to every enumeration.
 	while (connect_device(vendor_id, product_id)) {
+		if (please_stop_ep0)
+			return 0;
 		usleep(200 * 1000);
 	}
 	printf("[%.3f] Device opened successfully\n", uptime_s());
@@ -736,8 +743,27 @@ int main(int argc, char **argv)
 	int fd = usb_raw_open();
 	// Always use USB_SPEED_HIGH for the gadget; some UDCs (e.g., musb-hdrc)
 	// reject lower speeds. We compensate by adjusting bInterval below.
-	usb_raw_init(fd, USB_SPEED_HIGH, driver, device);
-	usb_raw_run(fd);
+	// The UDC may still be unbinding from the previous instance's gadget
+	// (a respawn): retry briefly on EBUSY before giving up (the exiting
+	// wrapper would take the process down and inittab would respawn it,
+	// which also works, only slower).
+	int rv_init = usb_raw_init_try(fd, USB_SPEED_HIGH, driver, device);
+	if (rv_init < 0) {
+		errno = -rv_init;
+		perror("ioctl(USB_RAW_IOCTL_INIT)");
+		exit(EXIT_FAILURE);
+	}
+	int rv_run = -EBUSY;
+	for (int attempt = 0; attempt < 40 && rv_run == -EBUSY; attempt++) {
+		rv_run = usb_raw_run_try(fd);
+		if (rv_run == -EBUSY)
+			usleep(50 * 1000);
+	}
+	if (rv_run < 0) {
+		errno = -rv_run;
+		perror("ioctl(USB_RAW_IOCTL_RUN)");
+		exit(EXIT_FAILURE);
+	}
 
 	if (remap_host_endpoints_if_needed(fd) < 0) {
 		close(fd);

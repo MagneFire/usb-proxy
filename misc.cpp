@@ -25,6 +25,14 @@ void block_incidental_signals(bool keep_sigusr1)
 	pthread_sigmask(SIG_BLOCK, &set, nullptr);
 }
 
+void unblock_sigusr1(void)
+{
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, SIGUSR1);
+	pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
+}
+
 double uptime_s(void) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);

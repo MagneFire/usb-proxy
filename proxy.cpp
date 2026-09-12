@@ -7,6 +7,7 @@
 #include "misc.h"
 #include "adb-proto.h"
 #include "power-policy.h"
+#include "console-shell.h"
 
 #ifdef HAVE_LUA
 extern "C" {
@@ -1227,6 +1228,7 @@ void drain_in_queues_and_exit(void)
 	std::call_once(once, [] {
 		int cfg_idx = host_device_desc.current_config;
 		if (cfg_idx < 0) {
+			shell_kill();
 			fflush(stdout);
 			_exit(0);
 		}
@@ -1280,6 +1282,7 @@ void drain_in_queues_and_exit(void)
 		if (verbose_level > 0)
 			fprintf(stderr, "[drain] device gone; IN queues %s, exiting\n",
 				drained ? "flushed" : "flush timed out");
+		shell_kill();
 		fflush(stdout);
 		_exit(0);
 	});
@@ -1309,6 +1312,11 @@ void *ep_loop_write(void *arg) {
 	// Set a no-op handler for SIGUSR1. Sending this signal to the thread
 	// will thus interrupt a blocking ioctl call without other side-effects.
 	signal(SIGUSR1, noop_signal_handler);
+	// This thread is created from the ep0 thread, which blocks every async
+	// signal (see ep0_loop), and pthread_create copies that mask. Without
+	// this the SIGUSR1 from terminate_eps() stays pending and never
+	// interrupts a blocked EP_READ/EP_WRITE.
+	unblock_sigusr1();
 
 	// Check both per-endpoint flag (interface change) and global flag (device reset)
 	while (!*please_stop && !please_stop_eps) {
@@ -1487,6 +1495,11 @@ void *ep_loop_read(void *arg) {
 	// Set a no-op handler for SIGUSR1. Sending this signal to the thread
 	// will thus interrupt a blocking ioctl call without other side-effects.
 	signal(SIGUSR1, noop_signal_handler);
+	// This thread is created from the ep0 thread, which blocks every async
+	// signal (see ep0_loop), and pthread_create copies that mask. Without
+	// this the SIGUSR1 from terminate_eps() stays pending and never
+	// interrupts a blocked EP_READ/EP_WRITE.
+	unblock_sigusr1();
 
 	// Remaining payload bytes of an in-progress fastboot "download:%08x" on
 	// this (bulk OUT) endpoint; used to size the final gadget reads (see the

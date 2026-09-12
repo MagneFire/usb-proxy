@@ -175,6 +175,8 @@ int connect_device(int vendor_id, int product_id) {
 				announced = true;
 			}
 			libusb_free_device_list(devs, 1);
+			if (please_stop_ep0)
+				return 1;
 			usleep(DEVICE_POLL_MS * 1000);
 		}
 	}
