@@ -2,6 +2,14 @@
 
 This software is a USB proxy based on [raw-gadget](https://github.com/xairy/raw-gadget) and libusb. It is recommended to run this repo on a computer that has an USB OTG port, such as `Raspberry Pi 4` or other [hardware](https://github.com/xairy/raw-gadget/tree/master/tests#results) that can work with `raw-gadget`, otherwise might need to use `dummy_hcd` kernel module to set up virtual USB Device and Host controller that connected to each other inside the kernel.
 
+> **Orange Pi Zero (sunxi musb) appliance.** This fork's `opi` branch carries the
+> musb-specific fixes and the appliance features. The `meta-usbproxy` Yocto layer
+> turns an Orange Pi Zero into a single-purpose usb-proxy appliance (RAM
+> initramfs, the musb kernel fix as a kernel patch). Its `DEVELOPMENT.md` is the
+> full developer guide: building both projects, the change workflows (including
+> the fast usb-proxy dev loop against the appliance), flashing, USB console
+> access, and the project quirks.
+
 ```
 ------------     -----------------------------------------------     -----------------------
 |          |     |                                             |     |                     |
