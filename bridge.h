@@ -5,11 +5,17 @@
 // its two bridge interfaces are host_device_desc.configs[0].interfaces[slot].
 // Their endpoints are enabled for as long as the host keeps the configuration
 // set, and forwarding threads (proxy.cpp ep_loop_read/ep_loop_write) run on a
-// slot only while a device is bound to it. An unbound slot is HALTED: the
-// host's pending transfers fail at once instead of hanging, adb drops its
-// transport and re-opens it with a fresh CNXN (which then NAK-holds until a
-// device binds), and fastboot commands fail fast. A bound slot is un-halted
-// before its threads start.
+// slot only while a device is bound to it. The idle adb slot NAKs: the host's
+// adb opens it once, its CNXN sits pending until a device binds, and `adb
+// devices` shows a steady `offline` (a halted idle slot made macOS adb re-open
+// it every second, blinking the row). When a device leaves, its slot is
+// HALTED so the host's pending transfers fail at once and adb drops its stale
+// transport and comes back with a fresh CNXN; for adb that halt is a short
+// pulse (ADB_KICK_PULSE_MS) back to NAK, the fastboot slot stays halted so
+// fastboot commands fail fast. A bound slot is un-halted before its threads
+// start. While the adb slot is idle a sink thread drains its bulk OUT, so
+// the host's CNXN is captured in user space and replayed at the next bind
+// instead of sitting in the musb RX FIFO for as long as the watch is away.
 //
 // Two threads call in: the fixed gadget's ep0 thread (host configured /
 // unconfigured, endpoint halt requests) and the device manager in main()
@@ -70,11 +76,16 @@ void bridge_note_device_lost(const char *where);
 // bytes with no header in sight). It returns with the stream lock held, so
 // the caller must call bridge_out_done() once the read is forwarded (or
 // dropped) -- a replayed CNXN can then never land inside a host message.
-bool bridge_out_feed(const uint8_t *data, int len);
+// idle = the read came from the idle sink (no device on the adb slot): the
+// stream is framed and a CNXN recorded, and the read is always dropped.
+bool bridge_out_feed(const uint8_t *data, int len, bool idle = false);
 void bridge_out_done(void);
 // Device manager, shortly after a bind: if the host has not sent a CNXN since
 // the bind (its transport is stale from the previous device), replay the last
 // one it did send so the new adbd connects. No-op without a captured CNXN.
 void bridge_replay_cnxn_if_needed(void);
+// True when the recorded CNXN arrived while no device was bound (the idle
+// sink took it): the host is waiting on it, replay without the grace period.
+bool bridge_cnxn_pending(void);
 
 #endif /* BRIDGE_H */

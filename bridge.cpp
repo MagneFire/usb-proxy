@@ -1,8 +1,11 @@
 #include <errno.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -30,6 +33,10 @@ struct OutStream {
 	std::vector<uint8_t> cnxn_building;
 	uint32_t cnxn_building_left = 0;
 	bool cnxn_seen_since_bind = false;
+	// The recorded CNXN was captured while no device was bound: the host is
+	// waiting on it, so it is replayed the moment a device binds.
+	bool cnxn_pending = false;
+	unsigned cnxn_captures = 0;	// bumped whenever cnxn is (re)recorded
 };
 
 OutStream g_out;
@@ -49,6 +56,11 @@ struct Bridge {
 	int bound_slot = -1;		// device bound to this slot (or none)
 	bool running = false;		// bound slot's threads are up
 	bool halted[BRIDGE_NUM_SLOTS][2] = {};	// [slot][0=IN,1=OUT]
+	// Idle sink: drains the adb slot's bulk OUT while no device is bound
+	// to it (see sink_main).
+	pthread_t sink_thread = 0;
+	bool sink_running = false;
+	std::atomic<bool> sink_stop{false};
 
 	// The loss flag has its own lock: endpoint threads set it while the
 	// manager may hold mtx joining them.
@@ -93,12 +105,23 @@ bool find_ep(uint8_t addr, int *slot, int *dir)
 	return false;
 }
 
-// Caller holds g.mtx and the endpoints are enabled.
-void set_halt_locked(int slot, bool halt)
+// How long the adb slot stays halted at unbind: long enough for the host's
+// pending IN transfer to fail (microseconds) and for adb to drop its transport.
+const int ADB_KICK_PULSE_MS = 300;
+
+enum { DIR_IN = 1, DIR_OUT = 2, DIR_BOTH = 3 };
+
+// Caller holds g.mtx and the endpoints are enabled. Idempotent per endpoint:
+// clearing a halt that is not set is skipped, since on musb a clear can flush
+// a packet already sitting in the RX FIFO (the host's NAK-held CNXN, for the
+// idle adb slot).
+void set_halt_locked(int slot, bool halt, int dirs = DIR_BOTH)
 {
 	for (int d = 0; d < 2; d++) {
+		if (!(dirs & (d == 0 ? DIR_IN : DIR_OUT)))
+			continue;
 		struct raw_gadget_endpoint *ep = slot_ep(slot, d == 0);
-		if (!ep || ep->thread_info.ep_num < 0)
+		if (!ep || ep->thread_info.ep_num < 0 || g.halted[slot][d] == halt)
 			continue;
 		int rv = halt ? usb_raw_ep_set_halt_try(g.fd, ep->thread_info.ep_num)
 			      : usb_raw_ep_clear_halt_try(g.fd, ep->thread_info.ep_num);
@@ -111,9 +134,85 @@ void set_halt_locked(int slot, bool halt)
 	}
 }
 
+// The idle adb slot must not leave host data parked in the UDC. A CNXN
+// that sat in the musb RX FIFO for 27 s while the board idled (its bus
+// clocks dropped meanwhile) was gone at the next bind, and adb hung
+// offline; the toggle mismatch fixed at bridge_unbind() may have been the
+// real cause, but user space is the only place the packet is safe from
+// either. So while the slot has no device, this thread reads its bulk OUT
+// and runs the reads through the stream framer, which records the host's
+// CNXN in user space (replayed at the next bind) and drops everything else.
+void *sink_main(void *)
+{
+	signal(SIGUSR1, noop_signal_handler);
+	unblock_sigusr1();
+
+	struct raw_gadget_endpoint *out = slot_ep(BRIDGE_SLOT_ADB, false);
+	int ep_num = out->thread_info.ep_num;
+	unsigned maxp = usb_endpoint_maxp(&out->endpoint);
+	struct usb_raw_transfer_io io;
+	while (!g.sink_stop.load()) {
+		memset(&io.inner, 0, sizeof(io.inner));
+		io.inner.ep = ep_num;
+		io.inner.length = maxp;
+		int rv = usb_raw_ep_read_try(g.fd, (struct usb_raw_ep_io *)&io);
+		if (g.sink_stop.load())
+			break;
+		if (rv < 0) {
+			if (rv == -EINTR)
+				continue;
+			// Halted, unconfigured, reset: whoever did that stops the
+			// sink next; don't spin meanwhile.
+			usleep(50 * 1000);
+			continue;
+		}
+		if (verbose_level)
+			printf("EP%x(bulk_out): idle sink read %d bytes from host\n",
+			       out->endpoint.bEndpointAddress, rv);
+		// Nobody else feeds the stream while the sink runs, so the
+		// capture count can be sampled before taking the stream lock.
+		unsigned before = g_out.cnxn_captures;
+		bridge_out_feed((const uint8_t *)io.data, rv, true);
+		bool captured = g_out.cnxn_captures != before;
+		size_t banner = g_out.cnxn.size() >= 24 ? g_out.cnxn.size() - 24 : 0;
+		bridge_out_done();
+		if (captured)
+			printf("[%.3f] bridge: idle adb slot: host CNXN captured (%zu-byte banner), "
+			       "held for the next device\n", uptime_s(), banner);
+	}
+	return NULL;
+}
+
+// Caller holds g.mtx; configured, the adb slot unbound and un-halted.
+void sink_start_locked(void)
+{
+	if (g.sink_running)
+		return;
+	g.sink_stop = false;
+	if (pthread_create(&g.sink_thread, NULL, sink_main, NULL) != 0) {
+		perror("bridge: idle sink thread");
+		return;
+	}
+	g.sink_running = true;
+}
+
+// Caller holds g.mtx (the sink never takes it).
+void sink_stop_locked(void)
+{
+	if (!g.sink_running)
+		return;
+	g.sink_stop = true;
+	pthread_kill(g.sink_thread, SIGUSR1);
+	pthread_join(g.sink_thread, NULL);
+	g.sink_thread = 0;
+	g.sink_running = false;
+}
+
 // Caller holds g.mtx; configured && bound_slot >= 0 && !running.
 void start_locked(void)
 {
+	if (g.bound_slot == BRIDGE_SLOT_ADB)
+		sink_stop_locked();
 	set_halt_locked(g.bound_slot, false);
 	ack_accel_set_enabled(g.bound_slot == BRIDGE_SLOT_ADB);
 	eps_start(g.fd, slot_alt(g.bound_slot));
@@ -210,13 +309,23 @@ void bridge_host_configured(void)
 	std::lock_guard<std::mutex> guard(g.mtx);
 	if (g.configured)
 		return;
-	for (int s = 0; s < BRIDGE_NUM_SLOTS; s++) {
+	for (int s = 0; s < BRIDGE_NUM_SLOTS; s++)
 		eps_enable(g.fd, slot_alt(s));
-		set_halt_locked(s, true);
-	}
+	// The idle adb slot NAKs (enabled, no reader): the Mac's adb opens it
+	// once, its CNXN stays pending in the host controller until a device
+	// binds, and `adb devices` shows a steady `offline`. A halted idle slot
+	// instead made adb re-open it every second (it forgets a kicked device),
+	// which blinked an `offline` row in and out and spammed its log. The
+	// fastboot slot stays halted so fastboot commands fail fast.
+	set_halt_locked(BRIDGE_SLOT_FASTBOOT, true);
 	g.configured = true;
 	if (g.bound_slot >= 0)
 		start_locked();
+	if (g.bound_slot != BRIDGE_SLOT_ADB) {
+		sink_start_locked();
+		printf("[%.3f] bridge: adb slot idle (NAK, host CNXN captured for the next device)\n",
+		       uptime_s());
+	}
 }
 
 void bridge_host_unconfigured(void)
@@ -226,6 +335,7 @@ void bridge_host_unconfigured(void)
 		return;
 	if (g.running)
 		stop_locked(false);
+	sink_stop_locked();
 	for (int s = 0; s < BRIDGE_NUM_SLOTS; s++)
 		eps_disable(g.fd, slot_alt(s));
 	memset(g.halted, 0, sizeof(g.halted));
@@ -311,17 +421,42 @@ bool bridge_bind(int slot, uint8_t dev_in_addr, uint8_t dev_out_addr)
 
 void bridge_unbind(void)
 {
-	std::lock_guard<std::mutex> guard(g.mtx);
+	std::unique_lock<std::mutex> lock(g.mtx);
 	if (g.bound_slot < 0)
 		return;
 	int slot = g.bound_slot;
 	if (g.running)
 		stop_locked(true);
+	// Halt the slot the device left: the host's pending transfers fail at
+	// once instead of hanging on a device that is gone, and adb drops its
+	// transport (only the host sends CNXN, so a stale one would never see
+	// the next device). Fastboot stays halted; adb gets a pulse and goes
+	// back to NAK so its re-opened transport holds instead of churning.
+	// The adb pulse is IN only: adb's pending read is what kicks it, and
+	// halting OUT would reset the gadget's OUT data toggle (musb writes
+	// CLRDATATOG on set and clear) while the Mac keeps its own across the
+	// re-open. With the toggles apart the device ACKs the re-opened
+	// transport's CNXN header as a duplicate and drops it; the banner then
+	// arrives headless (seen: one cycle in two).
+	bool pulse = g.configured && slot == BRIDGE_SLOT_ADB;
 	if (g.configured)
-		set_halt_locked(slot, true);
+		set_halt_locked(slot, true, pulse ? DIR_IN : DIR_BOTH);
 	g.bound_slot = -1;
 	printf("[%.3f] bridge: %s slot unbound%s\n", uptime_s(), slot_name(slot),
-	       g.configured ? " (halted until the next device)" : "");
+	       !g.configured ? "" :
+	       pulse ? " (halt pulse to kick adb, then idle NAK)" :
+	       " (halted until the next device)");
+	if (!pulse)
+		return;
+	lock.unlock();
+	usleep(ADB_KICK_PULSE_MS * 1000);
+	lock.lock();
+	// Only the manager thread binds, so bound_slot is still -1; the host may
+	// have unconfigured meanwhile (halted[] is then already cleared).
+	if (g.configured && g.bound_slot < 0) {
+		set_halt_locked(slot, false, DIR_IN);
+		sink_start_locked();
+	}
 }
 
 bool bridge_wait_device_lost(int timeout_ms)
@@ -368,10 +503,10 @@ void bridge_note_device_lost(const char *where)
 // the payload as another, so a gadget read never spans a message boundary
 // (the ack accelerator in proxy.cpp relies on the same). One decision per
 // read is therefore enough.
-bool bridge_out_feed(const uint8_t *data, int len)
+bool bridge_out_feed(const uint8_t *data, int len, bool idle)
 {
 	g_out.mtx.lock();
-	if (g.bound_slot != BRIDGE_SLOT_ADB || len <= 0)
+	if ((!idle && g.bound_slot != BRIDGE_SLOT_ADB) || len <= 0)
 		return true;
 
 	if (g_out.payload_remaining > 0) {
@@ -383,6 +518,8 @@ bool bridge_out_feed(const uint8_t *data, int len)
 			if (g_out.cnxn_building_left == 0 && !g_out.dropping) {
 				g_out.cnxn = g_out.cnxn_building;
 				g_out.cnxn_building.clear();
+				g_out.cnxn_pending = idle;
+				g_out.cnxn_captures++;
 			}
 		}
 		bool forward = !g_out.dropping;
@@ -408,18 +545,27 @@ bool bridge_out_feed(const uint8_t *data, int len)
 	}
 	g_out.payload_remaining = plen;
 	if (cmd == A_CNXN) {
-		g_out.cnxn_seen_since_bind = true;
+		g_out.cnxn_seen_since_bind = !idle;
 		g_out.cnxn_building.assign(data, data + 24);
 		g_out.cnxn_building_left = plen;
-		if (plen == 0)
+		if (plen == 0) {
 			g_out.cnxn = g_out.cnxn_building;
+			g_out.cnxn_pending = idle;
+			g_out.cnxn_captures++;
+		}
 	}
-	return true;
+	return !idle;
 }
 
 void bridge_out_done(void)
 {
 	g_out.mtx.unlock();
+}
+
+bool bridge_cnxn_pending(void)
+{
+	std::lock_guard<std::mutex> l(g_out.mtx);
+	return g_out.cnxn_pending;
 }
 
 void bridge_replay_cnxn_if_needed(void)
@@ -438,8 +584,10 @@ void bridge_replay_cnxn_if_needed(void)
 	struct raw_gadget_endpoint *out = slot_ep(BRIDGE_SLOT_ADB, false);
 	uint8_t dev_ep = out->device_bEndpointAddress;
 	size_t plen = g_out.cnxn.size() - 24;
-	printf("[%.3f] bridge: host sent no CNXN since the bind; replaying its last one "
-	       "(%zu-byte banner) to the device\n", uptime_s(), plen);
+	printf("[%.3f] bridge: %s; replaying the host's last CNXN (%zu-byte banner) to the device\n",
+	       uptime_s(), g_out.cnxn_pending ? "host CNXN captured while idle"
+					      : "host sent no CNXN since the bind", plen);
+	g_out.cnxn_pending = false;
 	// Header and payload as two transfers, as adb sends them.
 	for (int part = 0; part < 2; part++) {
 		size_t off = part == 0 ? 0 : 24;

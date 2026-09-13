@@ -862,7 +862,10 @@ int main(int argc, char **argv)
 				// The host's CNXN, if its transport was restarted, arrives
 				// within milliseconds of the bind; give it half a second,
 				// then replay the previous one if the transport is stale.
-				if (slot == BRIDGE_SLOT_ADB && !bridge_wait_device_lost(500))
+				// One the idle sink captured is replayed at once: the host
+				// is already waiting on it.
+				if (slot == BRIDGE_SLOT_ADB &&
+				    (bridge_cnxn_pending() || !bridge_wait_device_lost(500)))
 					bridge_replay_cnxn_if_needed();
 
 				bridge_wait_device_lost(-1);
