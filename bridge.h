@@ -8,12 +8,18 @@
 // slot only while a device is bound to it. The idle adb slot NAKs: the host's
 // adb opens it once, its CNXN sits pending until a device binds, and `adb
 // devices` shows a steady `offline` (a halted idle slot made macOS adb re-open
-// it every second, blinking the row). When a device leaves, its slot is
-// HALTED so the host's pending transfers fail at once and adb drops its stale
-// transport and comes back with a fresh CNXN; for adb that halt is a short
-// pulse (ADB_KICK_PULSE_MS) back to NAK, the fastboot slot stays halted so
-// fastboot commands fail fast. A bound slot is un-halted before its threads
-// start. While the adb slot is idle a sink thread drains its bulk OUT, so
+// it every second, blinking the row). When a device leaves the adb slot, its
+// IN endpoint gets a short halt pulse (ADB_KICK_PULSE_MS) so the host's
+// pending read fails at once and adb drops its stale transport and comes
+// back with a fresh CNXN, then the slot is back to NAK. The fastboot slot is
+// never halted by the bridge: every set/clear halt resets the gadget's data
+// toggles on musb while the Mac keeps its own across watch mode switches, and
+// fastboot has no pending read that a STALL would make it reset them, so a
+// halt would drop the first packet of the next fastboot session. The idle
+// fastboot slot NAKs; a command sent while the watch is away parks in the
+// UDC and is delivered at the next bind. Only the host's own SET_FEATURE
+// halts are ever cleared at bind. While the adb slot is idle a sink thread
+// drains its bulk OUT, so
 // the host's CNXN is captured in user space and replayed at the next bind
 // instead of sitting in the musb RX FIFO for as long as the watch is away.
 //

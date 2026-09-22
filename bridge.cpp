@@ -213,6 +213,9 @@ void start_locked(void)
 {
 	if (g.bound_slot == BRIDGE_SLOT_ADB)
 		sink_stop_locked();
+	// Idempotent: only clears a halt the host itself set (SET_FEATURE), or
+	// the adb pulse if the host unconfigured/reconfigured mid-pulse. The
+	// bridge never leaves a slot halted on its own.
 	set_halt_locked(g.bound_slot, false);
 	ack_accel_set_enabled(g.bound_slot == BRIDGE_SLOT_ADB);
 	eps_start(g.fd, slot_alt(g.bound_slot));
@@ -311,13 +314,22 @@ void bridge_host_configured(void)
 		return;
 	for (int s = 0; s < BRIDGE_NUM_SLOTS; s++)
 		eps_enable(g.fd, slot_alt(s));
-	// The idle adb slot NAKs (enabled, no reader): the Mac's adb opens it
-	// once, its CNXN stays pending in the host controller until a device
-	// binds, and `adb devices` shows a steady `offline`. A halted idle slot
+	// Both idle slots NAK (enabled, no reader). adb: the Mac's adb opens the
+	// slot once, its CNXN stays pending in the host controller until a device
+	// binds, and `adb devices` shows a steady `offline`; a halted idle slot
 	// instead made adb re-open it every second (it forgets a kicked device),
-	// which blinked an `offline` row in and out and spammed its log. The
-	// fastboot slot stays halted so fastboot commands fail fast.
-	set_halt_locked(BRIDGE_SLOT_FASTBOOT, true);
+	// which blinked an `offline` row in and out and spammed its log.
+	// fastboot: the bridge never halts this slot. A halt (set or clear) on
+	// musb writes CLRDATATOG, and the Mac keeps its fastboot toggles across
+	// watch mode switches (this gadget never re-enumerates, and a fastboot
+	// session normally ends with nothing pending, so the host never sees a
+	// STALL that would make it reset its own). With the gadget's toggles reset
+	// behind the host's back, the first packet of the next session lands on
+	// the wrong toggle and is dropped as a duplicate: fastboot hangs, about
+	// one session in two. Left alone, both sides' toggles only ever move
+	// together. A fastboot command sent while the watch is away parks in the
+	// UDC and is delivered at the next bind, which is the transparent-mode
+	// "waiting for device" behaviour.
 	g.configured = true;
 	if (g.bound_slot >= 0)
 		start_locked();
@@ -427,25 +439,27 @@ void bridge_unbind(void)
 	int slot = g.bound_slot;
 	if (g.running)
 		stop_locked(true);
-	// Halt the slot the device left: the host's pending transfers fail at
-	// once instead of hanging on a device that is gone, and adb drops its
-	// transport (only the host sends CNXN, so a stale one would never see
-	// the next device). Fastboot stays halted; adb gets a pulse and goes
-	// back to NAK so its re-opened transport holds instead of churning.
-	// The adb pulse is IN only: adb's pending read is what kicks it, and
-	// halting OUT would reset the gadget's OUT data toggle (musb writes
-	// CLRDATATOG on set and clear) while the Mac keeps its own across the
-	// re-open. With the toggles apart the device ACKs the re-opened
-	// transport's CNXN header as a duplicate and drops it; the banner then
-	// arrives headless (seen: one cycle in two).
+	// adb: pulse a halt on the slot the device left, so the host's pending
+	// read fails at once and adb drops its transport (only the host sends
+	// CNXN, so a stale one would never see the next device), then back to
+	// NAK so the re-opened transport holds instead of churning. The pulse is
+	// IN only: adb's pending read is what kicks it, and halting OUT would
+	// reset the gadget's OUT data toggle (musb writes CLRDATATOG on set and
+	// clear) while the Mac keeps its own across the re-open. With the
+	// toggles apart the device ACKs the re-opened transport's CNXN header as
+	// a duplicate and drops it; the banner then arrives headless (seen: one
+	// cycle in two).
+	// fastboot: no halt at all, for the same toggle reason (see
+	// bridge_host_configured): fastboot has no read pending that a STALL
+	// would kick, so a pulse would only reset the gadget's toggles and
+	// desync the next session. The slot simply NAKs until the next device.
 	bool pulse = g.configured && slot == BRIDGE_SLOT_ADB;
-	if (g.configured)
-		set_halt_locked(slot, true, pulse ? DIR_IN : DIR_BOTH);
+	if (pulse)
+		set_halt_locked(slot, true, DIR_IN);
 	g.bound_slot = -1;
 	printf("[%.3f] bridge: %s slot unbound%s\n", uptime_s(), slot_name(slot),
 	       !g.configured ? "" :
-	       pulse ? " (halt pulse to kick adb, then idle NAK)" :
-	       " (halted until the next device)");
+	       pulse ? " (halt pulse to kick adb, then idle NAK)" : " (idle NAK)");
 	if (!pulse)
 		return;
 	lock.unlock();
