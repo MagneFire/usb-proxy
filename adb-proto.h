@@ -6,6 +6,7 @@
 #ifndef ADB_PROTO_H
 #define ADB_PROTO_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define ADB_HDR_LEN 24
@@ -58,6 +59,22 @@ static inline bool adb_parse_hdr(const uint8_t *p, uint32_t *cmd, uint32_t *arg0
 	*len = le32(p + 12);
 	uint32_t magic = le32(p + 20);
 	return magic == (*cmd ^ 0xffffffffU) && *len <= ADB_MAX_PAYLOAD;
+}
+
+// The header's data_check field: adb's payload checksum, the 32-bit sum of
+// the payload bytes (checked by adbd on every packet until the connection
+// negotiates a version that skips it; a CNXN always carries it).
+static inline uint32_t adb_hdr_data_check(const uint8_t *p)
+{
+	return le32(p + 16);
+}
+
+static inline uint32_t adb_data_check(const uint8_t *p, size_t n)
+{
+	uint32_t sum = 0;
+	for (size_t i = 0; i < n; i++)
+		sum += p[i];
+	return sum;
 }
 
 #endif /* ADB_PROTO_H */

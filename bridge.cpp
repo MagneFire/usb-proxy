@@ -49,6 +49,31 @@ bool parse_hdr(const uint8_t *p, uint32_t *cmd, uint32_t *len)
 	return adb_parse_hdr(p, cmd, &arg0, &arg1, len);
 }
 
+// Caller holds g_out.mtx; cnxn_building holds a complete CNXN (header and
+// payload). Record it for replay, unless its payload fails the header's
+// checksum: adbd drops such a packet without a word, and only the host
+// sends CNXN, so replaying it would leave adb offline for good. A bad
+// checksum means the framer was fed a stream that did not start at a
+// message boundary; the host's next CNXN is waited for instead.
+void cnxn_complete_locked(bool idle)
+{
+	const uint8_t *hdr = g_out.cnxn_building.data();
+	size_t plen = g_out.cnxn_building.size() - 24;
+	uint32_t want = adb_hdr_data_check(hdr);
+	uint32_t have = adb_data_check(hdr + 24, plen);
+	if (want != have) {
+		printf("[%.3f] bridge: captured CNXN fails its checksum (%zu-byte banner, "
+		       "%08x != %08x); discarded, waiting for the host's next one\n",
+		       uptime_s(), plen, have, want);
+		g_out.cnxn_building.clear();
+		return;
+	}
+	g_out.cnxn = g_out.cnxn_building;
+	g_out.cnxn_building.clear();
+	g_out.cnxn_pending = idle;
+	g_out.cnxn_captures++;
+}
+
 struct Bridge {
 	std::mutex mtx;		// state below
 	int fd = -1;
@@ -523,18 +548,34 @@ bool bridge_out_feed(const uint8_t *data, int len, bool idle)
 	if ((!idle && g.bound_slot != BRIDGE_SLOT_ADB) || len <= 0)
 		return true;
 
+	uint32_t cmd, plen;
+	// Idle slot only: a header where payload was due means the host
+	// re-opened its transport mid-message. That happens when adb's rescan
+	// lands inside the unbind halt pulse: its read stalls again, and the
+	// CNXN it had started is aborted after the 24-byte header went out
+	// (musb ACKs one packet into the RX FIFO with no reader). Taking the
+	// next open's header as payload would record a CNXN with a garbled
+	// banner. Drop the partial message and start over at this header. Not
+	// on the bound path: the host is never kicked there, and a payload
+	// chunk that happens to parse as a header would corrupt a live stream.
+	if (idle && g_out.payload_remaining > 0 && len == 24 && parse_hdr(data, &cmd, &plen)) {
+		printf("[%.3f] bridge: idle adb slot: header where %u payload bytes were due "
+		       "(host re-opened its transport); dropping the partial message\n",
+		       uptime_s(), g_out.payload_remaining);
+		g_out.payload_remaining = 0;
+		g_out.cnxn_building.clear();
+		g_out.cnxn_building_left = 0;
+		g_out.dropping = false;
+	}
+
 	if (g_out.payload_remaining > 0) {
 		uint32_t take = (uint32_t)len < g_out.payload_remaining ? len : g_out.payload_remaining;
 		g_out.payload_remaining -= take;
 		if (g_out.cnxn_building_left > 0) {
 			g_out.cnxn_building.insert(g_out.cnxn_building.end(), data, data + take);
 			g_out.cnxn_building_left -= take;
-			if (g_out.cnxn_building_left == 0 && !g_out.dropping) {
-				g_out.cnxn = g_out.cnxn_building;
-				g_out.cnxn_building.clear();
-				g_out.cnxn_pending = idle;
-				g_out.cnxn_captures++;
-			}
+			if (g_out.cnxn_building_left == 0 && !g_out.dropping)
+				cnxn_complete_locked(idle);
 		}
 		bool forward = !g_out.dropping;
 		if (g_out.payload_remaining == 0 && g_out.dropping) {
@@ -545,7 +586,6 @@ bool bridge_out_feed(const uint8_t *data, int len, bool idle)
 	}
 
 	// A header is due.
-	uint32_t cmd, plen;
 	if (len != 24 || !parse_hdr(data, &cmd, &plen)) {
 		if (!g_out.unsynced)
 			printf("[%.3f] bridge: %d host bytes where a header was due; dropping until "
@@ -562,11 +602,8 @@ bool bridge_out_feed(const uint8_t *data, int len, bool idle)
 		g_out.cnxn_seen_since_bind = !idle;
 		g_out.cnxn_building.assign(data, data + 24);
 		g_out.cnxn_building_left = plen;
-		if (plen == 0) {
-			g_out.cnxn = g_out.cnxn_building;
-			g_out.cnxn_pending = idle;
-			g_out.cnxn_captures++;
-		}
+		if (plen == 0)
+			cnxn_complete_locked(idle);
 	}
 	return !idle;
 }
