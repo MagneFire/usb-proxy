@@ -1409,8 +1409,9 @@ void *ep_loop_write(void *arg) {
 				perror("usb_raw_ep_write()");
 				exit(EXIT_FAILURE);
 			}
-			printf("EP%x(%s_%s): wrote %d bytes to host\n", ep.bEndpointAddress,
-				transfer_type.c_str(), dir.c_str(), rv);
+			if (verbose_level)
+				printf("EP%x(%s_%s): wrote %d bytes to host\n", ep.bEndpointAddress,
+					transfer_type.c_str(), dir.c_str(), rv);
 		}
 		else {
 			int length = io.inner.length;
@@ -1768,8 +1769,9 @@ void *ep_loop_read(void *arg) {
 				perror("usb_raw_ep_read()");
 				exit(EXIT_FAILURE);
 			}
-			printf("EP%x(%s_%s): read %d bytes from host\n", ep.bEndpointAddress,
-					transfer_type.c_str(), dir.c_str(), rv);
+			if (verbose_level)
+				printf("EP%x(%s_%s): read %d bytes from host\n", ep.bEndpointAddress,
+						transfer_type.c_str(), dir.c_str(), rv);
 			io.inner.length = rv;
 			power_note_activity(rv);
 
