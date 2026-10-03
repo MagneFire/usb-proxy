@@ -36,10 +36,22 @@ std::atomic<bool> please_stop_hotplug_monitor{false};
 static char device_node_path[32];
 static std::atomic<bool> node_watch(false);
 
+// The libusb device behind dev_handle (the handle keeps it referenced, so
+// the pointer stays valid until the close). The hotplug callback is
+// registered for any device leaving the bus, which with the persistent
+// gadget covers device changes without re-registering; this is what tells
+// the proxied device apart from any other one that leaves.
+static std::atomic<libusb_device *> proxied_dev(nullptr);
+
 int hotplug_callback(struct libusb_context *ctx __attribute__((unused)),
-			struct libusb_device *dev __attribute__((unused)),
+			struct libusb_device *dev,
 			libusb_hotplug_event envet __attribute__((unused)),
 			void *user_data __attribute__((unused))) {
+	if (dev != proxied_dev) {
+		if (verbose_level)
+			printf("Hotplug event: a device the proxy did not open left, ignored\n");
+		return 0;
+	}
 	// Used to kill(0, SIGINT), which only sets the stop flags: the ep0 thread
 	// blocked in USB_RAW_IOCTL_EVENT_FETCH is not interrupted unless the signal
 	// happens to land on it, and even then main() ends in a pthread_join on
@@ -105,6 +117,7 @@ int device_settle_ms = 0;
 // drop the config descriptors get_descriptor() allocated for this attempt.
 static void drop_device_attempt(void) {
 	node_watch = false;
+	proxied_dev = nullptr;
 	if (dev_handle) {
 		libusb_close(dev_handle);
 		dev_handle = NULL;
@@ -223,6 +236,8 @@ int connect_device(int vendor_id, int product_id) {
 	}
 
 	result = libusb_open(found, &dev_handle);
+	if (result == LIBUSB_SUCCESS)
+		proxied_dev = found;
 	libusb_free_device_list(devs, 1);
 	if (verbose_level)
 		printf("[%.3f] libusb_open done (%d)\n", uptime_s(), result);
