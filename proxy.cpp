@@ -2150,6 +2150,16 @@ void ep0_loop(int fd) {
 		if (event.inner.type != USB_RAW_EVENT_CONTROL)
 			continue;
 
+		// io.data is MAX_TRANSFER_SIZE bytes; wLength goes up to 65535.
+		// The proxy cannot carry a bigger control transfer either way,
+		// so stall instead of running off the end of the buffer.
+		if (event.ctrl.wLength > MAX_TRANSFER_SIZE) {
+			printf("ep0: wLength %u exceeds the %d-byte transfer buffer, stalling\n",
+				event.ctrl.wLength, MAX_TRANSFER_SIZE);
+			usb_raw_ep0_stall(fd);
+			continue;
+		}
+
 		struct usb_raw_transfer_io io;
 		io.inner.ep = 0;
 		io.inner.flags = 0;
@@ -2175,6 +2185,8 @@ void ep0_loop(int fd) {
 		if (event.ctrl.bRequestType & USB_DIR_IN) {
 			result = control_request(&event.ctrl, &nbytes, &control_data, USB_REQUEST_TIMEOUT);
 			if (result == 0) {
+				if (nbytes > MAX_TRANSFER_SIZE)
+					nbytes = MAX_TRANSFER_SIZE;
 				memcpy(&io.data[0], control_data, nbytes);
 				io.inner.length = nbytes;
 
