@@ -75,11 +75,14 @@ extern bool auto_remap_endpoints;
 // host's real OKAYs for that pair are swallowed on the OUT stream. Same
 // credit model, separate per-direction bookkeeping (pull_pairs). The
 // device-bound spoof may only be submitted while the host->device parser is
-// at a message boundary; since out_feed() runs before the OUT thread submits
-// the read it just parsed, the worst interleaving is two *complete* messages
-// swapping order, which ADB doesn't care about. Mid-message the spoof parks
-// in pending_out and the OUT read thread flushes it right after its own
-// submit (out_flush()).
+// at a message boundary AND the OUT read thread has nothing parsed but not
+// yet submitted: out_feed() runs before that thread submits the read it just
+// parsed, so a boundary alone is not enough. OUT reads are one packet on musb
+// and a WRTE payload spans several of them; a spoof slipped in between the
+// last chunk's parse and its submit would land inside that payload on the
+// device. Hence out_inflight: set by out_feed(), cleared by out_flush() right
+// after the submit, and while set the spoof parks in pending_out like it does
+// mid-message. The OUT thread flushes pending_out in out_flush().
 #define ACK_ACCEL_MAX_AHEAD 8
 
 class AdbAckAccel {
@@ -129,6 +132,10 @@ class AdbAckAccel {
 	// Device-bound spoofs waiting for the host->device stream to reach a
 	// message boundary.
 	std::deque<uint8_t *> pending_out;
+	// out_feed() parsed a read the OUT thread has not submitted yet (see the
+	// header comment). The sync bulk-OUT path never calls out_flush(), but
+	// on_device_wrte() is a no-op there, so a flag left set is harmless.
+	bool out_inflight = false;
 	uint64_t pull_spoofed = 0, pull_swallowed = 0;
 
 	// Lock order everywhere: mtx, then the endpoint queue's data_mutex.
@@ -285,7 +292,7 @@ class AdbAckAccel {
 				(unsigned long long)pull_spoofed, in.arg0, in.arg1,
 				st.tokens, out.at_boundary() ? "" : " deferred");
 
-		if (out.at_boundary()) {
+		if (out.at_boundary() && !out_inflight) {
 			flush_pending_out_locked(in_ti->peer_out);
 			submit_to_device(in_ti->peer_out, buf);
 		} else {
@@ -302,6 +309,7 @@ public:
 		dead = false;
 		out.reset();
 		in.reset();
+		out_inflight = false;
 		clear_streams();
 		spoofed = swallowed = 0;
 		pull_spoofed = pull_swallowed = 0;
@@ -338,7 +346,8 @@ public:
 					if (!it->second.held.empty())
 						fprintf(stderr, "[ackaccel] release %zu held device-bound ack(s) (%u,%u)\n",
 							it->second.held.size(), arg1, arg0);
-					flush_pending_out_locked(ti);
+					if (!out_inflight)
+						flush_pending_out_locked(ti);
 					while (!it->second.held.empty()) {
 						it->second.tokens--;
 						pull_spoofed++;
@@ -406,6 +415,9 @@ public:
 			if (out.cmd == WRTE)
 				on_wrte_complete(ti);
 		}
+		// The caller submits this read next; device-bound spoofs wait
+		// for out_flush() even if the parser is at a boundary now.
+		out_inflight = true;
 		return false;
 	}
 
@@ -416,6 +428,7 @@ public:
 	void out_flush(struct thread_info *ti)
 	{
 		std::lock_guard<std::mutex> guard(mtx);
+		out_inflight = false;
 		if (dead || pending_out.empty() || !out.at_boundary())
 			return;
 		flush_pending_out_locked(ti);
